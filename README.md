@@ -1,6 +1,6 @@
 # ml-systems
 
-**Project A:** Roofline plot for square fp32 and fp16 matmul on a 5070 laptop gpu, with measured TFLOPS overlaid on the theoretical ceiling.
+**Project A:** Roofline plot for square fp32 and fp16 matmul on a 5060 laptop gpu, with measured TFLOPS overlaid on the theoretical ceiling.
 
 **Project B:** Three cuda kernels benchmarked against Pytorch's defaults (aim to understand operator fusion)
 
