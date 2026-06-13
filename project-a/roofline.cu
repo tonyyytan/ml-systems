@@ -103,6 +103,7 @@ double benchmark_matmul_fp32(cublasHandle_t handle, int N, int warmup = 5, int i
         cudaEventCreate(&start);
         cudaEventCreate(&stop);
 
+        cudaEventRecord(start);
         cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, &alpha, A, N, B, N, &beta, C, N);
         cudaEventRecord(stop);
         cudaEventSynchronize(stop);
@@ -158,9 +159,9 @@ struct MatmulStats {
  * bytes_per_elem: 4 for FP32, 2 for FP16
  */
 MatmulStats matmul_arithmetic_intensity(int N, int bytes_per_elem) {
-    // TODO: implement
-    (void)N; (void)bytes_per_elem;
-    return {0, 0, 0.0};
+    long long flops = 2LL * N * N * N;
+    long long bytes = 3LL * N * N * bytes_per_elem;
+    return {flops, bytes, (double)flops / bytes};
 }
 
 // ---------------------------------------------------------------------------
@@ -180,9 +181,16 @@ struct SweepResults {
  * Collect into SweepResults and return.
  */
 SweepResults run_sweep_fp32(cublasHandle_t handle, const std::vector<int>& sizes) {
-    // TODO: implement
-    (void)handle;
-    return {sizes, {}, {}};
+    SweepResults r;
+    r.sizes = sizes;
+    for (int N : sizes) {
+        fprintf(stderr, "  fp32 N=%d...\n", N);
+        MatmulStats s = matmul_arithmetic_intensity(N, 4);
+        double elapsed = benchmark_matmul_fp32(handle, N);
+        r.intensities.push_back(s.arithmetic_intensity);
+        r.tflops.push_back((double)s.flops / elapsed / 1e12);
+    }
+    return r;
 }
 
 /*
@@ -214,8 +222,20 @@ SweepResults run_sweep_fp16(cublasHandle_t handle, const std::vector<int>& sizes
  *   - ridge point is at peak_tflops / MEM_BW_TB_S (units: FLOP/byte)
  */
 void print_results(const char* label, double peak_tflops, const SweepResults& r) {
-    // TODO: implement
-    (void)label; (void)peak_tflops; (void)r;
+    if (r.tflops.empty()) return;
+    // Measured points
+    for (size_t i = 0; i < r.sizes.size(); i++)
+        printf("%s,measured,%d,%.6f,%.6f\n",
+               label, r.sizes[i], r.intensities[i], r.tflops[i]);
+
+    // Roofline ceiling curve (100 log-spaced x values)
+    const int n = 100;
+    double x_min = 0.1, x_max = 1000.0;
+    for (int i = 0; i < n; i++) {
+        double x = x_min * pow(x_max / x_min, (double)i / (n - 1));
+        double attainable = std::min(MEM_BW_TB_S * x, peak_tflops);
+        printf("%s,ceiling,0,%.6f,%.6f\n", label, x, attainable);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -225,17 +245,17 @@ int main() {
     int device = 0;
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
-    printf("Device: %s\n", prop.name);
+    fprintf(stderr, "Device: %s\n", prop.name);
 
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
 
     std::vector<int> sizes = {128, 256, 512, 1024, 2048, 4096, 8192};
 
-    printf("Benchmarking fp32...\n");
+    fprintf(stderr, "Benchmarking fp32...\n");
     SweepResults fp32_results = run_sweep_fp32(handle, sizes);
 
-    printf("Benchmarking fp16...\n");
+    fprintf(stderr, "Benchmarking fp16...\n");
     SweepResults fp16_results = run_sweep_fp16(handle, sizes);
 
     // Print CSV to stdout; redirect to roofline.csv and plot separately
