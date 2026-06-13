@@ -1,0 +1,23 @@
+# Build outputs
+project-a/roofline
+project-a/*.o
+project-a/*.csv
+project-a/*.png
+
+# CUDA intermediates
+*.ptx
+*.cubin
+*.fatbin
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
