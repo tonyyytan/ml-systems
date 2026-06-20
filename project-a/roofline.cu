@@ -119,9 +119,6 @@ double benchmark_matmul_fp32(cublasHandle_t handle, int N, int warmup = 5, int i
     cudaFree(B);
     cudaFree(C);
     return median;
-
-    (void)handle; (void)N; (void)warmup; (void)iters;
-    return 0.0;
 }
 
 /*
@@ -136,9 +133,43 @@ double benchmark_matmul_fp32(cublasHandle_t handle, int N, int warmup = 5, int i
  */
 double benchmark_matmul_fp16(cublasHandle_t handle, int N,
                               int warmup = 5, int iters = 20) {
-    // TODO: implement
-    (void)handle; (void)N; (void)warmup; (void)iters;
-    return 0.0;
+    __half *A, *B, *C;
+    CUDA_CHECK(cudaMalloc(&A, N * N * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&B, N * N * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&C, N * N * sizeof(__half)));
+
+    __half alpha = __float2half(1.0f), beta = __float2half(0.0f);
+    for (int i = 0; i < warmup; ++i)
+        CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N,
+                                  &alpha, A, CUDA_R_16F, N, B, CUDA_R_16F, N,
+                                  &beta,  C, CUDA_R_16F, N,
+                                  CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    std::vector<float> times(iters);
+    for (int i = 0; i < iters; ++i) {
+        cudaEvent_t start, stop;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+
+        CUDA_CHECK(cudaEventRecord(start));
+        CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N,
+                                  &alpha, A, CUDA_R_16F, N, B, CUDA_R_16F, N,
+                                  &beta,  C, CUDA_R_16F, N,
+                                  CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        CUDA_CHECK(cudaEventElapsedTime(&times[i], start, stop));
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+    }
+
+    std::sort(times.begin(), times.end());
+    double median = times[iters / 2] / 1000.0;
+    CUDA_CHECK(cudaFree(A));
+    CUDA_CHECK(cudaFree(B));
+    CUDA_CHECK(cudaFree(C));
+    return median;
 }
 
 // ---------------------------------------------------------------------------
