@@ -228,9 +228,16 @@ SweepResults run_sweep_fp32(cublasHandle_t handle, const std::vector<int>& sizes
  * Same as run_sweep_fp32 but calls benchmark_matmul_fp16 and uses bytes_per_elem=2.
  */
 SweepResults run_sweep_fp16(cublasHandle_t handle, const std::vector<int>& sizes) {
-    // TODO: implement
-    (void)handle;
-    return {sizes, {}, {}};
+    SweepResults r;
+    r.sizes = sizes;
+    for (int N : sizes) {
+        fprintf(stderr, "  fp16 N=%d...\n", N);
+        MatmulStats s = matmul_arithmetic_intensity(N, 2);
+        double elapsed = benchmark_matmul_fp16(handle, N);
+        r.intensities.push_back(s.arithmetic_intensity);
+        r.tflops.push_back((double)s.flops / elapsed / 1e12);
+    }
+    return r;
 }
 
 // ---------------------------------------------------------------------------
