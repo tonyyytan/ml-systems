@@ -94,24 +94,22 @@ double benchmark_matmul_fp32(cublasHandle_t handle, int N, int warmup = 5, int i
          cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, &alpha, A, N, B, N, &beta, C, N);
     }
 
-    //time each iteration with cuda events
+    //time each iteration with cuda events (created once, reused across iters)
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
     std::vector<float> times(iters);
     for (int i{}; i < iters; ++i) {
-        //intializes start and stop var as time int?
-        cudaEvent_t start, stop;
-        //assigns it to the event
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
-
         cudaEventRecord(start);
         cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, &alpha, A, N, B, N, &beta, C, N);
         cudaEventRecord(stop);
         cudaEventSynchronize(stop);
 
         cudaEventElapsedTime(&times[i], start, stop);
-        cudaEventDestroy(start);
-        cudaEventDestroy(stop);
     }
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 
     std::sort(times.begin(), times.end());
     double median = times[iters/2] / 1000.0;
@@ -145,12 +143,12 @@ double benchmark_matmul_fp16(cublasHandle_t handle, int N,
                                   &beta,  C, CUDA_R_16F, N,
                                   CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
     std::vector<float> times(iters);
     for (int i = 0; i < iters; ++i) {
-        cudaEvent_t start, stop;
-        CUDA_CHECK(cudaEventCreate(&start));
-        CUDA_CHECK(cudaEventCreate(&stop));
-
         CUDA_CHECK(cudaEventRecord(start));
         CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N,
                                   &alpha, A, CUDA_R_16F, N, B, CUDA_R_16F, N,
@@ -160,9 +158,9 @@ double benchmark_matmul_fp16(cublasHandle_t handle, int N,
         CUDA_CHECK(cudaEventSynchronize(stop));
 
         CUDA_CHECK(cudaEventElapsedTime(&times[i], start, stop));
-        CUDA_CHECK(cudaEventDestroy(start));
-        CUDA_CHECK(cudaEventDestroy(stop));
     }
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
 
     std::sort(times.begin(), times.end());
     double median = times[iters / 2] / 1000.0;
@@ -276,6 +274,184 @@ void print_results(const char* label, double peak_tflops, const SweepResults& r)
     }
 }
 
+__global__ void matmul_naive_fp32(float *A, float *B, float *C, int N) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < N && col < N) {
+        float output{};
+        for (int j{}; j < N; ++j) {
+            output += A[row * N + j] * B[j * N + col];
+        }
+
+        C[row * N + col] = output;
+    }
+}
+
+__global__ void matmul_naive_fp16(__half *A, __half *B, __half *C, int N) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < N && col < N) {
+        __half output{};
+        for (int j{}; j < N; ++j) {
+            output += A[row * N + j] * B[j * N + col];
+        }
+
+        C[row * N + col] = output;
+    }
+}
+
+//Reuse the row to dot with new columns, right now is computing only 1 element per thread (coarsening thread)
+//Or use shared memory tiling, then we can access the rows and cols as often as we'd like for a thread
+__global__ void matmul_optimized_fp32(float *A, float *B, float *C, int N) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < N && col < N) {
+        float output{};
+        for (int j{}; j < N; ++j) {
+            output += A[row * N + j] * B[j * N + col];
+        }
+
+        C[row * N + col] = output;
+    }
+}
+
+__global__ void matmul_optimized_fp16(__half *A, __half *B, __half *C, int N) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < N && col < N) {
+        __half output{};
+        for (int j{}; j < N; ++j) {
+            output += A[row * N + j] * B[j * N + col];
+        }
+
+        C[row * N + col] = output;
+    }
+}
+
+double benchmark_matmul_fp32_naive(int N, int warmup = 5,int iters = 20) {
+    float *A, *B, *C;
+
+    //store it matrix in 1d array on gpu vram
+    cudaMalloc(&A, N * N * sizeof(float));
+    cudaMalloc(&B, N * N * sizeof(float));
+    cudaMalloc(&C, N * N * sizeof(float));
+
+    cudaMemset(A, 0, N * N * sizeof(float));
+    cudaMemset(B, 0, N * N * sizeof(float));
+    cudaMemset(C, 0, N * N * sizeof(float));
+
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((N + threadsPerBlock.x - 1) / threadsPerBlock.x, (N + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    for (int i{}; i < warmup; ++i) {
+        matmul_naive_fp32<<<numBlocks, threadsPerBlock>>>(A, B, C, N);
+    }
+
+    cudaDeviceSynchronize();
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    std::vector<float> times(iters);
+    for(int i{}; i < iters; ++i) {
+        cudaEventRecord(start);
+        matmul_naive_fp32<<<numBlocks, threadsPerBlock>>>(A, B, C, N);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+
+        cudaEventElapsedTime(&times[i], start, stop);
+    }
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    std::sort(times.begin(), times.end());
+    double median = times[iters / 2] / 1000.0;
+
+    cudaFree(A);
+    cudaFree(B);
+    cudaFree(C);
+
+    return median;
+}
+
+double benchmark_matmul_fp16_naive (int N, int warmup = 5, int iters = 20) {
+    __half *A, *B, *C;
+
+    cudaMalloc(&A, N * N * sizeof(__half));
+    cudaMalloc(&B, N * N * sizeof(__half));
+    cudaMalloc(&C, N * N * sizeof(__half));
+
+    cudaMemset(A, 0, N * N * sizeof(__half));
+    cudaMemset(B, 0, N * N * sizeof(__half));
+    cudaMemset(C, 0, N * N * sizeof(__half));
+
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((N + threadsPerBlock.x - 1) / threadsPerBlock.x, (N + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    for (int i{}; i < warmup; ++i) {
+        matmul_naive_fp16<<<numBlocks, threadsPerBlock>>>(A, B, C, N);
+    }
+
+    cudaDeviceSynchronize();
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    std::vector<float> times(iters);
+    for(int i{}; i < iters; ++i) {
+        cudaEventRecord(start);
+        matmul_naive_fp16<<<numBlocks, threadsPerBlock>>>(A, B, C, N);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+
+        cudaEventElapsedTime(&times[i], start, stop);
+    }
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    cudaFree(A);
+    cudaFree(B);
+    cudaFree(C);
+
+    std::sort(times.begin(), times.end());
+    double median = times[iters / 2] / 1000.0;
+
+    return median;
+
+}
+
+SweepResults run_sweep_naive_fp32(const std::vector<int>& sizes) {
+    SweepResults r;
+    r.sizes = sizes;
+    for (int N : sizes) {
+        fprintf(stderr, "  fp32 N=%d...\n", N);
+        MatmulStats s = matmul_arithmetic_intensity(N, 4);
+        double elapsed = benchmark_matmul_fp32_naive(N);
+        r.intensities.push_back(s.arithmetic_intensity);
+        r.tflops.push_back((double)s.flops / elapsed / 1e12);
+    }
+    return r;
+} 
+
+SweepResults run_sweep_naive_fp16(const std::vector<int>& sizes) {
+    SweepResults r;
+    r.sizes = sizes;
+    for (int N : sizes) {
+        fprintf(stderr, "  fp16 N=%d...\n", N);
+        MatmulStats s = matmul_arithmetic_intensity(N, 2);
+        double elapsed = benchmark_matmul_fp16_naive(N);
+        r.intensities.push_back(s.arithmetic_intensity);
+        r.tflops.push_back((double)s.flops / elapsed / 1e12);
+    }
+    return r;
+} 
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -296,10 +472,18 @@ int main() {
     fprintf(stderr, "Benchmarking fp16...\n");
     SweepResults fp16_results = run_sweep_fp16(handle, sizes);
 
+    fprintf(stderr, "Benchmarking fp32 naive kernel...\n");
+    SweepResults fp32_naive_results = run_sweep_naive_fp32(sizes);
+
+    fprintf(stderr, "Benchmarking fp16 naive kernel...\n");
+    SweepResults fp16_naive_results = run_sweep_naive_fp16(sizes);
+
     // Print CSV to stdout; redirect to roofline.csv and plot separately
     printf("dtype,kind,size_or_x,intensity_or_x,tflops\n");
     print_results("fp32", PEAK_FP32_TFLOPS, fp32_results);
     print_results("fp16", PEAK_FP16_TFLOPS, fp16_results);
+    print_results("fp32_naive", PEAK_FP32_TFLOPS, fp32_naive_results);
+    print_results("fp16_naive", PEAK_FP16_TFLOPS, fp16_naive_results);
 
     CUBLAS_CHECK(cublasDestroy(handle));
     return 0;

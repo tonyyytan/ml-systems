@@ -8,12 +8,23 @@ Usage:
 import sys
 import csv
 import math
+from collections import defaultdict
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
+# Display style per series. cuBLAS series draw their roofline ceiling and use a
+# filled circle; the naive custom-kernel series share the same ceiling (same
+# peak/bandwidth) so we skip re-drawing it and use a hollow diamond marker.
+SERIES = {
+    "fp32":        {"color": "#4C72B0", "label": "FP32 (cuBLAS)",          "marker": "o", "ceiling": True},
+    "fp16":        {"color": "#DD8452", "label": "FP16 cuBLAS (tensor)",   "marker": "o", "ceiling": True},
+    "fp32_naive":  {"color": "#55A868", "label": "FP32 (naive kernel)",    "marker": "D", "ceiling": False},
+    "fp16_naive":  {"color": "#C44E52", "label": "FP16 (naive kernel)",    "marker": "D", "ceiling": False},
+}
+
 def load_csv(path):
-    ceiling = {"fp32": [], "fp16": []}
-    measured = {"fp32": [], "fp16": []}
+    ceiling = defaultdict(list)
+    measured = defaultdict(list)
 
     with open(path) as f:
         reader = csv.DictReader(f)
@@ -35,23 +46,26 @@ def plot(csv_path):
 
     fig, ax = plt.subplots(figsize=(10, 6))
 
-    colors = {"fp32": "#4C72B0", "fp16": "#DD8452"}
-    labels = {"fp32": "FP32", "fp16": "FP16 (tensor cores)"}
-
-    for dtype in ("fp32", "fp16"):
-        c = colors[dtype]
+    # Plot any series present in the CSV; fall back to a default style for
+    # unexpected labels so nothing is silently dropped.
+    for dtype in sorted(set(ceiling) | set(measured)):
+        style = SERIES.get(dtype, {"color": None, "label": dtype,
+                                   "marker": "s", "ceiling": True})
+        c = style["color"]
 
         # Roofline ceiling curve
-        if ceiling[dtype]:
+        if style["ceiling"] and ceiling[dtype]:
             xs, ys = zip(*ceiling[dtype])
-            ax.plot(xs, ys, color=c, linewidth=2, label=f"{labels[dtype]} ceiling")
+            line, = ax.plot(xs, ys, color=c, linewidth=2,
+                            label=f"{style['label']} ceiling")
+            c = line.get_color()
 
         # Measured points
         if measured[dtype]:
             _, intensities, tflops = zip(*measured[dtype])
-            sizes = [m[0] for m in measured[dtype]]
-            sc = ax.scatter(intensities, tflops, color=c, zorder=5,
-                            s=60, marker="o", edgecolors="white", linewidths=0.8)
+            ax.scatter(intensities, tflops, color=c, zorder=5,
+                       s=60, marker=style["marker"], edgecolors="white",
+                       linewidths=0.8, label=f"{style['label']} measured")
             # Annotate each point with the matrix size N
             for n, xi, yi in measured[dtype]:
                 ax.annotate(f"N={n}", (xi, yi),
