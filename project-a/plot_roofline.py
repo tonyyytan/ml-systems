@@ -16,10 +16,12 @@ import matplotlib.ticker as ticker
 # filled circle; the naive custom-kernel series share the same ceiling (same
 # peak/bandwidth) so we skip re-drawing it and use a hollow diamond marker.
 SERIES = {
-    "fp32":        {"color": "#4C72B0", "label": "FP32 (cuBLAS)",          "marker": "o", "ceiling": True},
-    "fp16":        {"color": "#DD8452", "label": "FP16 cuBLAS (tensor)",   "marker": "o", "ceiling": True},
-    "fp32_naive":  {"color": "#55A868", "label": "FP32 (naive kernel)",    "marker": "D", "ceiling": False},
-    "fp16_naive":  {"color": "#C44E52", "label": "FP16 (naive kernel)",    "marker": "D", "ceiling": False},
+    "fp32":            {"color": "#4C72B0", "label": "FP32 (cuBLAS)",            "marker": "o", "ceiling": True},
+    "fp16":            {"color": "#DD8452", "label": "FP16 cuBLAS (tensor)",     "marker": "o", "ceiling": True},
+    "fp32_naive":      {"color": "#55A868", "label": "FP32 (naive kernel)",      "marker": "D", "ceiling": False},
+    "fp16_naive":      {"color": "#C44E52", "label": "FP16 (naive kernel)",      "marker": "D", "ceiling": False},
+    "fp32_optimized":  {"color": "#8172B3", "label": "FP32 (tiled kernel)",      "marker": "^", "ceiling": False},
+    "fp16_optimized":  {"color": "#937860", "label": "FP16 (tiled kernel)",      "marker": "^", "ceiling": False},
 }
 
 def load_csv(path):

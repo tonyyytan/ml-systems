@@ -26,6 +26,8 @@
 #include <cstdlib>
 #include <vector>
 
+#define TILE_DIM 32
+
 // ---------------------------------------------------------------------------
 // 1. Hardware constants for RTX 5060 laptop GPU (Lenovo Legion 5, Blackwell GB206)
 //
@@ -293,42 +295,91 @@ __global__ void matmul_naive_fp16(__half *A, __half *B, __half *C, int N) {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (row < N && col < N) {
-        __half output{};
+        float output = 0.0f;
         for (int j{}; j < N; ++j) {
-            output += A[row * N + j] * B[j * N + col];
+            output += __half2float(A[row * N + j]) * __half2float(B[j * N + col]);
         }
 
-        C[row * N + col] = output;
+        C[row * N + col] = __float2half(output);
     }
 }
 
-//Reuse the row to dot with new columns, right now is computing only 1 element per thread (coarsening thread)
-//Or use shared memory tiling, then we can access the rows and cols as often as we'd like for a thread
-__global__ void matmul_optimized_fp32(float *A, float *B, float *C, int N) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (row < N && col < N) {
-        float output{};
-        for (int j{}; j < N; ++j) {
-            output += A[row * N + j] * B[j * N + col];
+//Current optimized uses shared tiling only, still 1 kernel = 1 output, but faster memory access
+//Future: optimize further by implementing register blocking, 1 kernel = multiple outputs
+
+__global__ void matmul_optimized_fp32(float *A, float *B, float *C, int N) {
+    int row = blockIdx.y * TILE_DIM + threadIdx.y;
+    int col = blockIdx.x * TILE_DIM + threadIdx.x;
+    
+    __shared__ float tile_A[TILE_DIM][TILE_DIM];
+    __shared__ float tile_B[TILE_DIM][TILE_DIM];
+
+    float value{};
+
+    for(int i{}; i < (N + TILE_DIM - 1) / TILE_DIM; ++i) {
+        if (row < N && (i * TILE_DIM + threadIdx.x) < N) {
+            tile_A[threadIdx.y][threadIdx.x] = A[row * N + i * TILE_DIM + threadIdx.x];
+        } else {
+            tile_A[threadIdx.y][threadIdx.x] = 0.0f;
         }
 
-        C[row * N + col] = output;
+        if (col < N && (i * TILE_DIM + threadIdx.y) < N) {
+            tile_B[threadIdx.y][threadIdx.x] = B[(i * TILE_DIM + threadIdx.y) * N + col];
+        } else {
+            tile_B[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+        
+        __syncthreads();
+
+        if (row < N && col < N) {
+            for(int k{}; k < TILE_DIM; ++k) {
+                value += tile_A[threadIdx.y][k] * tile_B[k][threadIdx.x];
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (row < N && col < N) {
+        C[row * N + col] = value;
     }
 }
 
 __global__ void matmul_optimized_fp16(__half *A, __half *B, __half *C, int N) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * TILE_DIM + threadIdx.y;
+    int col = blockIdx.x * TILE_DIM + threadIdx.x;
 
-    if (row < N && col < N) {
-        __half output{};
-        for (int j{}; j < N; ++j) {
-            output += A[row * N + j] * B[j * N + col];
+    __shared__ __half tile_A[TILE_DIM][TILE_DIM];
+    __shared__ __half tile_B[TILE_DIM][TILE_DIM];
+
+    float value = 0.0f;
+
+    for(int i{}; i < (N + TILE_DIM - 1) / TILE_DIM; ++i) {
+        if(row < N && (i * TILE_DIM + threadIdx.x) < N) {
+            tile_A[threadIdx.y][threadIdx.x] = A[row * N + i * TILE_DIM + threadIdx.x];
+        } else {
+            tile_A[threadIdx.y][threadIdx.x] = (__half)0.0f;
         }
 
-        C[row * N + col] = output;
+        if (col < N && (i * TILE_DIM + threadIdx.y) < N) {
+            tile_B[threadIdx.y][threadIdx.x] = B[(i * TILE_DIM + threadIdx.y) * N + col];
+        } else {
+            tile_B[threadIdx.y][threadIdx.x] = (__half)0.0f;
+        }
+
+        __syncthreads();
+
+        if (row < N && col < N) {
+            for(int k{}; k < TILE_DIM; ++k) {
+                value += __half2float(tile_A[threadIdx.y][k]) * __half2float(tile_B[k][threadIdx.x]);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (row < N && col < N) {
+        C[row * N + col] = __float2half(value);
     }
 }
 
@@ -336,45 +387,45 @@ double benchmark_matmul_fp32_naive(int N, int warmup = 5,int iters = 20) {
     float *A, *B, *C;
 
     //store it matrix in 1d array on gpu vram
-    cudaMalloc(&A, N * N * sizeof(float));
-    cudaMalloc(&B, N * N * sizeof(float));
-    cudaMalloc(&C, N * N * sizeof(float));
+    CUDA_CHECK(cudaMalloc(&A, N * N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&B, N * N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&C, N * N * sizeof(float)));
 
-    cudaMemset(A, 0, N * N * sizeof(float));
-    cudaMemset(B, 0, N * N * sizeof(float));
-    cudaMemset(C, 0, N * N * sizeof(float));
+    CUDA_CHECK(cudaMemset(A, 0, N * N * sizeof(float)));
+    CUDA_CHECK(cudaMemset(B, 0, N * N * sizeof(float)));
+    CUDA_CHECK(cudaMemset(C, 0, N * N * sizeof(float)));
 
-    dim3 threadsPerBlock(16, 16);
+    dim3 threadsPerBlock(TILE_DIM, TILE_DIM);
     dim3 numBlocks((N + threadsPerBlock.x - 1) / threadsPerBlock.x, (N + threadsPerBlock.y - 1) / threadsPerBlock.y);
 
     for (int i{}; i < warmup; ++i) {
         matmul_naive_fp32<<<numBlocks, threadsPerBlock>>>(A, B, C, N);
     }
-
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaGetLastError());      // catch bad launch config
+    CUDA_CHECK(cudaDeviceSynchronize()); // catch errors during execution
 
     cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
 
     std::vector<float> times(iters);
     for(int i{}; i < iters; ++i) {
-        cudaEventRecord(start);
+        CUDA_CHECK(cudaEventRecord(start));
         matmul_naive_fp32<<<numBlocks, threadsPerBlock>>>(A, B, C, N);
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
 
-        cudaEventElapsedTime(&times[i], start, stop);
+        CUDA_CHECK(cudaEventElapsedTime(&times[i], start, stop));
     }
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
 
     std::sort(times.begin(), times.end());
     double median = times[iters / 2] / 1000.0;
 
-    cudaFree(A);
-    cudaFree(B);
-    cudaFree(C);
+    CUDA_CHECK(cudaFree(A));
+    CUDA_CHECK(cudaFree(B));
+    CUDA_CHECK(cudaFree(C));
 
     return median;
 }
@@ -382,42 +433,136 @@ double benchmark_matmul_fp32_naive(int N, int warmup = 5,int iters = 20) {
 double benchmark_matmul_fp16_naive (int N, int warmup = 5, int iters = 20) {
     __half *A, *B, *C;
 
-    cudaMalloc(&A, N * N * sizeof(__half));
-    cudaMalloc(&B, N * N * sizeof(__half));
-    cudaMalloc(&C, N * N * sizeof(__half));
+    CUDA_CHECK(cudaMalloc(&A, N * N * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&B, N * N * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&C, N * N * sizeof(__half)));
 
-    cudaMemset(A, 0, N * N * sizeof(__half));
-    cudaMemset(B, 0, N * N * sizeof(__half));
-    cudaMemset(C, 0, N * N * sizeof(__half));
+    CUDA_CHECK(cudaMemset(A, 0, N * N * sizeof(__half)));
+    CUDA_CHECK(cudaMemset(B, 0, N * N * sizeof(__half)));
+    CUDA_CHECK(cudaMemset(C, 0, N * N * sizeof(__half)));
 
-    dim3 threadsPerBlock(16, 16);
+    dim3 threadsPerBlock(TILE_DIM, TILE_DIM);
     dim3 numBlocks((N + threadsPerBlock.x - 1) / threadsPerBlock.x, (N + threadsPerBlock.y - 1) / threadsPerBlock.y);
 
     for (int i{}; i < warmup; ++i) {
         matmul_naive_fp16<<<numBlocks, threadsPerBlock>>>(A, B, C, N);
     }
-
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaGetLastError());      // catch bad launch config
+    CUDA_CHECK(cudaDeviceSynchronize()); // catch errors during execution
 
     cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
 
     std::vector<float> times(iters);
     for(int i{}; i < iters; ++i) {
-        cudaEventRecord(start);
+        CUDA_CHECK(cudaEventRecord(start));
         matmul_naive_fp16<<<numBlocks, threadsPerBlock>>>(A, B, C, N);
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
 
-        cudaEventElapsedTime(&times[i], start, stop);
+        CUDA_CHECK(cudaEventElapsedTime(&times[i], start, stop));
     }
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
 
-    cudaFree(A);
-    cudaFree(B);
-    cudaFree(C);
+    CUDA_CHECK(cudaFree(A));
+    CUDA_CHECK(cudaFree(B));
+    CUDA_CHECK(cudaFree(C));
+
+    std::sort(times.begin(), times.end());
+    double median = times[iters / 2] / 1000.0;
+
+    return median;
+
+}
+
+double benchmark_matmul_fp32_optimized(int N, int warmup = 5,int iters = 20) {
+    float *A, *B, *C;
+
+    //store it matrix in 1d array on gpu vram
+    CUDA_CHECK(cudaMalloc(&A, N * N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&B, N * N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&C, N * N * sizeof(float)));
+
+    CUDA_CHECK(cudaMemset(A, 0, N * N * sizeof(float)));
+    CUDA_CHECK(cudaMemset(B, 0, N * N * sizeof(float)));
+    CUDA_CHECK(cudaMemset(C, 0, N * N * sizeof(float)));
+
+    dim3 threadsPerBlock(TILE_DIM, TILE_DIM);
+    dim3 numBlocks((N + threadsPerBlock.x - 1) / threadsPerBlock.x, (N + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    for (int i{}; i < warmup; ++i) {
+        matmul_optimized_fp32<<<numBlocks, threadsPerBlock>>>(A, B, C, N);
+    }
+    CUDA_CHECK(cudaGetLastError());      // catch bad launch config
+    CUDA_CHECK(cudaDeviceSynchronize()); // catch errors during execution
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    std::vector<float> times(iters);
+    for(int i{}; i < iters; ++i) {
+        CUDA_CHECK(cudaEventRecord(start));
+        matmul_optimized_fp32<<<numBlocks, threadsPerBlock>>>(A, B, C, N);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        CUDA_CHECK(cudaEventElapsedTime(&times[i], start, stop));
+    }
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    std::sort(times.begin(), times.end());
+    double median = times[iters / 2] / 1000.0;
+
+    CUDA_CHECK(cudaFree(A));
+    CUDA_CHECK(cudaFree(B));
+    CUDA_CHECK(cudaFree(C));
+
+    return median;
+}
+
+double benchmark_matmul_fp16_optimized (int N, int warmup = 5, int iters = 20) {
+    __half *A, *B, *C;
+
+    CUDA_CHECK(cudaMalloc(&A, N * N * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&B, N * N * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&C, N * N * sizeof(__half)));
+
+    CUDA_CHECK(cudaMemset(A, 0, N * N * sizeof(__half)));
+    CUDA_CHECK(cudaMemset(B, 0, N * N * sizeof(__half)));
+    CUDA_CHECK(cudaMemset(C, 0, N * N * sizeof(__half)));
+
+    dim3 threadsPerBlock(TILE_DIM, TILE_DIM);
+    dim3 numBlocks((N + threadsPerBlock.x - 1) / threadsPerBlock.x, (N + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    for (int i{}; i < warmup; ++i) {
+        matmul_optimized_fp16<<<numBlocks, threadsPerBlock>>>(A, B, C, N);
+    }
+    CUDA_CHECK(cudaGetLastError());      // catch bad launch config
+    CUDA_CHECK(cudaDeviceSynchronize()); // catch errors during execution
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    std::vector<float> times(iters);
+    for(int i{}; i < iters; ++i) {
+        CUDA_CHECK(cudaEventRecord(start));
+        matmul_optimized_fp16<<<numBlocks, threadsPerBlock>>>(A, B, C, N);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        CUDA_CHECK(cudaEventElapsedTime(&times[i], start, stop));
+    }
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    CUDA_CHECK(cudaFree(A));
+    CUDA_CHECK(cudaFree(B));
+    CUDA_CHECK(cudaFree(C));
 
     std::sort(times.begin(), times.end());
     double median = times[iters / 2] / 1000.0;
@@ -452,6 +597,32 @@ SweepResults run_sweep_naive_fp16(const std::vector<int>& sizes) {
     return r;
 } 
 
+SweepResults run_sweep_optimized_fp32(const std::vector<int>& sizes) {
+    SweepResults r;
+    r.sizes = sizes;
+    for (int N : sizes) {
+        fprintf(stderr, " optimized fp32 N=%d...\n", N);
+        MatmulStats s = matmul_arithmetic_intensity(N, 4);
+        double elapsed = benchmark_matmul_fp32_optimized(N);
+        r.intensities.push_back(s.arithmetic_intensity);
+        r.tflops.push_back((double)s.flops / elapsed / 1e12);
+    }
+    return r;
+} 
+
+SweepResults run_sweep_optimized_fp16(const std::vector<int>& sizes) {
+    SweepResults r;
+    r.sizes = sizes;
+    for (int N : sizes) {
+        fprintf(stderr, " optimized fp16 N=%d...\n", N);
+        MatmulStats s = matmul_arithmetic_intensity(N, 2);
+        double elapsed = benchmark_matmul_fp16_optimized(N);
+        r.intensities.push_back(s.arithmetic_intensity);
+        r.tflops.push_back((double)s.flops / elapsed / 1e12);
+    }
+    return r;
+} 
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -477,6 +648,12 @@ int main() {
 
     fprintf(stderr, "Benchmarking fp16 naive kernel...\n");
     SweepResults fp16_naive_results = run_sweep_naive_fp16(sizes);
+
+    fprintf(stderr, "Benchmarking fp32 optimized kernel...\n");
+    SweepResults fp32_naive_results = run_sweep_optimized_fp32(sizes);
+
+    fprintf(stderr, "Benchmarking fp16 optimized kernel...\n");
+    SweepResults fp16_naive_results = run_sweep_optimized_fp16(sizes);
 
     // Print CSV to stdout; redirect to roofline.csv and plot separately
     printf("dtype,kind,size_or_x,intensity_or_x,tflops\n");
