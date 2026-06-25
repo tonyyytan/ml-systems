@@ -601,7 +601,7 @@ SweepResults run_sweep_optimized_fp32(const std::vector<int>& sizes) {
     SweepResults r;
     r.sizes = sizes;
     for (int N : sizes) {
-        fprintf(stderr, " optimized fp32 N=%d...\n", N);
+        fprintf(stderr, "  fp32 N=%d...\n", N);
         MatmulStats s = matmul_arithmetic_intensity(N, 4);
         double elapsed = benchmark_matmul_fp32_optimized(N);
         r.intensities.push_back(s.arithmetic_intensity);
@@ -614,7 +614,7 @@ SweepResults run_sweep_optimized_fp16(const std::vector<int>& sizes) {
     SweepResults r;
     r.sizes = sizes;
     for (int N : sizes) {
-        fprintf(stderr, " optimized fp16 N=%d...\n", N);
+        fprintf(stderr, "  fp16 N=%d...\n", N);
         MatmulStats s = matmul_arithmetic_intensity(N, 2);
         double elapsed = benchmark_matmul_fp16_optimized(N);
         r.intensities.push_back(s.arithmetic_intensity);
@@ -650,10 +650,10 @@ int main() {
     SweepResults fp16_naive_results = run_sweep_naive_fp16(sizes);
 
     fprintf(stderr, "Benchmarking fp32 optimized kernel...\n");
-    SweepResults fp32_naive_results = run_sweep_optimized_fp32(sizes);
+    SweepResults fp32_optimized_results = run_sweep_optimized_fp32(sizes);
 
     fprintf(stderr, "Benchmarking fp16 optimized kernel...\n");
-    SweepResults fp16_naive_results = run_sweep_optimized_fp16(sizes);
+    SweepResults fp16_optimized_results = run_sweep_optimized_fp16(sizes);
 
     // Print CSV to stdout; redirect to roofline.csv and plot separately
     printf("dtype,kind,size_or_x,intensity_or_x,tflops\n");
@@ -661,6 +661,8 @@ int main() {
     print_results("fp16", PEAK_FP16_TFLOPS, fp16_results);
     print_results("fp32_naive", PEAK_FP32_TFLOPS, fp32_naive_results);
     print_results("fp16_naive", PEAK_FP16_TFLOPS, fp16_naive_results);
+    print_results("fp32_optimized", PEAK_FP32_TFLOPS, fp32_optimized_results);
+    print_results("fp16_optimized", PEAK_FP16_TFLOPS, fp16_optimized_results);
 
     CUBLAS_CHECK(cublasDestroy(handle));
     return 0;
