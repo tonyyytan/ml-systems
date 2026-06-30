@@ -12,13 +12,31 @@
  *   (a) unfused: separate CUDA kernels / PyTorch ops, each touching global mem
  *   (b) fused:   single kernel that reads once, writes once
  *
- * Build:
+ * Build (standalone C++ benchmark):
  *   make
- *
- * Run:
  *   ./kernels > results.csv
  *   python3 plot_fusion.py results.csv
+ *
+ * Build (PyTorch extension for benchmark.py):
+ *   python setup.py build_ext --inplace
+ *   python benchmark.py
+ *
+ * The file is split into three sections:
+ *   A) Raw CUDA kernels          — __global__ functions, no PyTorch dependency
+ *   B) Standalone C++ main()     — compiled by make, uses cudaMalloc directly
+ *   C) PyTorch extension glue    — compiled by setup.py, exposes ops to Python
+ *      (guarded by #ifdef TORCH_EXTENSION — set automatically by setup.py)
  */
+
+// ---------------------------------------------------------------------------
+// Includes
+// ---------------------------------------------------------------------------
+// When building the PyTorch extension, torch/extension.h must come first.
+// The #ifdef lets the same file compile both as a standalone binary (make)
+// and as a Python extension (setup.py).
+#ifdef TORCH_EXTENSION
+#include <torch/extension.h>
+#endif
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -176,6 +194,109 @@ void run_add_layernorm(int rows, int C) {
     (void)d_x; (void)d_residual; (void)d_gamma; (void)d_beta; (void)d_out;
 }
 
+// ===========================================================================
+// SECTION C: PyTorch C++ Extension
+//
+// Only compiled when building via setup.py (which defines TORCH_EXTENSION).
+// This section exposes the raw CUDA kernels above to Python via pybind11.
+//
+// Key concepts:
+//
+//   at::Tensor          — the PyTorch tensor type in C++
+//   tensor.data_ptr<scalar_t>()   — raw pointer to the underlying data
+//   tensor.numel()      — total number of elements (like .numel() in Python)
+//   tensor.contiguous() — ensures elements are laid out without gaps/strides
+//   at::empty_like(x)   — allocate output with same shape/dtype/device as x
+//
+//   AT_DISPATCH_FLOATING_TYPES_AND_HALF(dtype, "name", [&]() {
+//       using scalar_t = ...;  // float or at::Half, resolved at runtime
+//       // launch kernel using scalar_t pointers
+//   });
+//
+//   Kernel launch syntax (reminder):
+//       int threads = 256;
+//       int blocks  = (N + threads - 1) / threads;   // ceil(N / threads)
+//       my_kernel<<<blocks, threads>>>(args...);
+//
+//   TORCH_CHECK(condition, "error message")  — like assert but for PyTorch ops
+// ===========================================================================
+#ifdef TORCH_EXTENSION
+
+// --------------------------------------------------------------------------
+// relu_fwd: wraps relu_kernel
+// --------------------------------------------------------------------------
+at::Tensor relu_fwd(at::Tensor x) {
+    // TODO:
+    //   1. TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor")
+    //   2. x = x.contiguous()
+    //   3. auto y = at::empty_like(x)
+    //   4. int N = x.numel()
+    //   5. int threads = 256, blocks = (N + threads - 1) / threads
+    //   6. AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "relu_fwd", [&]() {
+    //          relu_kernel<<<blocks, threads>>>(
+    //              x.data_ptr<scalar_t>(), y.data_ptr<scalar_t>(), N);
+    //      });
+    //   7. return y
+    return x; // placeholder — remove once implemented
+}
+
+// --------------------------------------------------------------------------
+// TODO: gelu_fwd — wraps gelu_kernel (unfused, no bias)
+// --------------------------------------------------------------------------
+at::Tensor gelu_fwd(at::Tensor x) {
+    // TODO: same structure as relu_fwd but calling gelu_kernel
+    return x;
+}
+
+// --------------------------------------------------------------------------
+// TODO: bias_gelu_fwd — wraps bias_gelu_fused_kernel
+//   Takes x (N,) and bias (C,) where N is divisible by C
+// --------------------------------------------------------------------------
+at::Tensor bias_gelu_fwd(at::Tensor x, at::Tensor bias) {
+    // TODO
+    return x;
+}
+
+// --------------------------------------------------------------------------
+// TODO: add_layernorm_fwd — wraps add_layernorm_fused_kernel
+//   Takes x (rows, C), residual (rows, C), gamma (C,), beta (C,), eps
+// --------------------------------------------------------------------------
+at::Tensor add_layernorm_fwd(at::Tensor x, at::Tensor residual,
+                              at::Tensor gamma, at::Tensor beta,
+                              float eps) {
+    // TODO
+    return x;
+}
+
+// --------------------------------------------------------------------------
+// Module registration
+//
+// PYBIND11_MODULE(name, m) { m.def(...) } is the pybind11 way to expose
+// C++ functions to Python. TORCH_EXTENSION_NAME is filled in by setup.py.
+//
+// After building, in Python:
+//   import activations_cuda as A
+//   y = A.relu_fwd(x)
+// --------------------------------------------------------------------------
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.doc() = "Project B: fused activation CUDA kernels";
+
+    m.def("relu_fwd",          &relu_fwd,          "ReLU forward");
+    m.def("gelu_fwd",          &gelu_fwd,          "GELU forward (unfused)");
+
+    // TODO: uncomment once implemented
+    // m.def("bias_gelu_fwd",     &bias_gelu_fwd,     "Bias + GELU fused forward");
+    // m.def("add_layernorm_fwd", &add_layernorm_fwd, "Add + LayerNorm fused forward");
+}
+
+#endif // TORCH_EXTENSION
+
+
+// ===========================================================================
+// SECTION B: Standalone C++ entry point (compiled by make, not setup.py)
+// ===========================================================================
+#ifndef TORCH_EXTENSION
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -203,3 +324,5 @@ int main() {
 
     return 0;
 }
+
+#endif // !TORCH_EXTENSION
