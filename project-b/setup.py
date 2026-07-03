@@ -24,8 +24,10 @@ setup(
         CUDAExtension(
             name="activations_cuda",
             sources=["kernels.cu"],
-            # TODO: add nvcc flags here if needed, e.g.:
-            # extra_compile_args={"nvcc": ["-O3", "-arch=sm_120"]},
+            extra_compile_args={
+                "cxx": ["-03", "-std=c++17"],
+                "nvcc": ["-03", "-arch=sm_120", "-std=c++17", "-diag-suppress=177"]
+            }
         )
     ],
     cmdclass={"build_ext": BuildExtension},
