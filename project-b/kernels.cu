@@ -98,11 +98,30 @@ double benchmark_ms(Fn&& fn, int warmup = 5, int iters = 20) {
 //   Reads: N floats   Writes: N floats   Total bytes: 2 * N * 4
 // ===========================================================================
 
-__global__ void relu_kernel(const float* __restrict__ x,
-                             float* __restrict__ y,
-                             int N) {
-    // TODO: implement
-    // hint: grid-stride loop over elements
+__global__ void relu_kernel(const float* __restrict__ x, float* __restrict__ y, int N) {
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    float4* y4 = reinterpret_cast<float4*>(y);
+
+    for(; i < N / 4; i+= stride) {
+
+        float4 data = x4[i];
+        data.x = fmaxf(0.0f, data.x);
+        data.y = fmaxf(0.0f, data.y);
+        data.z = fmaxf(0.0f, data.z);
+        data.w = fmaxf(0.0f, data.w);
+        y4[i] = data;
+    }
+
+    int remainder_start = (N / 4) * 4;
+    int remainder_idx = remainder_start + (blockIdx.x * blockDim.x + threadIdx.x);
+
+    if (remainder_idx < N) {
+        y[remainder_idx] = fmaxf(0.0f, x[remainder_idx]);
+    }
 }
 
 void run_relu(int N) {
@@ -117,27 +136,103 @@ void run_relu(int N) {
 //   pass 2:  y[i] = gelu(y[i])
 // ===========================================================================
 
-__global__ void bias_add_kernel(const float* __restrict__ x,
-                                 const float* __restrict__ bias,
-                                 float* __restrict__ y,
-                                 int N, int C) {
-    // TODO: implement
+//possibly put bias into shared memory can have each of the threads read 1 of the bias elements before then sync, but only works if C < 64kb?
+__global__ void bias_add_kernel(const float* __restrict__ x, const float* __restrict__ bias, float* __restrict__ y, int N, int C) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    float4* y4 = reinterpret_cast<float4*>(y);
+
+    for(; i < N /4; i += stride) {
+        float4 input = x4[i];
+
+        int raw_idx = i * 4;
+
+        float bias_x = bias[raw_idx % C];
+        float bias_y = bias[(raw_idx + 1) % C];
+        float bias_z = bias[(raw_idx + 2) % C];
+        float bias_w = bias[(raw_idx + 3) % C];
+
+        float4 result;
+        result.x = input.x + bias_x;
+        result.y = input.y + bias_y;
+        result.z = input.z + bias_z;
+        result.w = input.w + bias_w;
+
+        y4[i] = result;
+    }
+
+    int remainder_start = (N / 4) * 4;
+    int remainder_idx = remainder_start + blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (remainder_idx < N) {
+        y[remainder_idx] = x[remainder_idx] + bias[remainder_idx % C];
+    }
 }
 
 __global__ void gelu_kernel(float* __restrict__ y, int N) {
-    // TODO: implement
-    // GELU(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    float4* y4 = reinterpret_cast<float4*>(y);
+
+    for(; i < N / 4; i += stride) {
+        float4 input = y4[i];
+        float4 result;
+
+        result.x = input.x * 0.5f * (1.0f + erff(input.x / std::sqrtf(2)));
+        result.y = input.y * 0.5f * (1.0f + erff(input.y / std::sqrtf(2)));
+        result.z = input.z * 0.5f * (1.0f + erff(input.z / std::sqrtf(2)));
+        result.w = input.w * 0.5f * (1.0f + erff(input.w / std::sqrtf(2)));
+
+        y4[i] = result;
+    }
+
+    int remainder_start = (N / 4) * 4;
+    int remainder_idx = remainder_start + blockDim.x * blockIdx.x + threadIdx.x;
+
+    if (remainder_idx < N) {
+        y[remainder_idx] = y[remainder_idx] * 0.5f * (1.0f + erff(y[remainder_idx] / std::sqrtf(2)));
+    }
 }
 
 // ===========================================================================
 // Kernel 2b (fused): Bias + GELU — single kernel, one global mem read/write
 // ===========================================================================
 
-__global__ void bias_gelu_fused_kernel(const float* __restrict__ x,
-                                        const float* __restrict__ bias,
-                                        float* __restrict__ y,
-                                        int N, int C) {
-    // TODO: implement — combine bias add and gelu in one pass
+__global__ void bias_gelu_fused_kernel(const float* __restrict__ x, const float* __restrict__ bias, float* __restrict__ y, int N, int C) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    float4* y4 = reinterpret_cast<float4*>(y);
+
+    for(; i < N / 4; i += stride) {
+        float4 input = x4[i];
+        float4 result;
+        int raw_idx = i * 4;
+
+        result.x = input.x + bias[raw_idx % C];
+        result.y = input.y + bias[(raw_idx + 1) % C];
+        result.z = input.z + bias[(raw_idx + 2) % C];
+        result.w = input.w + bias[(raw_idx + 3) % C];
+
+        result.x = result.x * 0.5f * (1.0f + erff(result.x / std::sqrtf(2)));
+        result.y = result.y * 0.5f * (1.0f + erff(result.y / std::sqrtf(2)));
+        result.z = result.z * 0.5f * (1.0f + erff(result.z / std::sqrtf(2)));
+        result.w = result.w * 0.5f * (1.0f + erff(result.w / std::sqrtf(2)));
+
+        y4[i] = result;
+    }
+
+    int remainder_start = (N / 4) * 4;
+    int remainder_idx = remainder_start + blockDim.x * blockIdx.x + threadIdx.x;
+
+    if (remainder_idx < N) {
+        float temp = x[remainder_idx] + bias[remainder_idx % C];
+        y[remainder_idx] = temp * 0.5f * (1.0f + erff(temp / std::sqrtf(2)));
+    }
 }
 
 void run_bias_gelu(int N, int C) {
@@ -157,19 +252,43 @@ void run_bias_gelu(int N, int C) {
 //     out[r,c] = gamma[c] * (row[c] - mean) / sqrt(var + eps) + beta[c]
 // ===========================================================================
 
-__global__ void add_kernel(const float* __restrict__ x,
-                            const float* __restrict__ residual,
-                            float* __restrict__ out,
-                            int N) {
-    // TODO: implement
+__global__ void add_kernel(const float* __restrict__ x, const float* __restrict__ residual, float* __restrict__ out, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    const float4* r4 = reinterpret_cast<const float*4>(residual);
+    float4* out4 = reinterpret_cast<float4*>(out);
+
+    for(; i < N / 4; i +=stride) {
+        float4 input = x4[i];
+        float4 res = r4[i];
+        float4 output;
+
+        output.x = input.x + res.x;
+        output.y = input.y + res.y;
+        output.z = input.z + res.z;
+        output.w = input.w + res.w;
+        
+        out4[i] = output;
+    }
+
+    int remainder_start = (N / 4) * 4;
+    int remainder_idx = remainder_start + blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (remainder_idx < N) {
+        out[remainder_idx] = x[remainder_idx] + residual[remainder_idx];
+    }
 }
 
-__global__ void layernorm_kernel(const float* __restrict__ x,
-                                  const float* __restrict__ gamma,
-                                  const float* __restrict__ beta,
-                                  float* __restrict__ out,
-                                  int rows, int C,
-                                  float eps) {
+__global__ void layernorm_kernel(const float* __restrict__ x, const float* __restrict__ gamma, const float* __restrict__ beta, float* __restrict__ out, int rows, int C, float eps) {
+    
+    
+    
+    
+    
+    
+    
     // TODO: implement — one block per row, use shared memory for reduction
     // hint: each block handles one row; threads cooperate to compute mean/var
 }
@@ -275,7 +394,7 @@ at::Tensor add_layernorm_fwd(at::Tensor x, at::Tensor residual,
 // C++ functions to Python. TORCH_EXTENSION_NAME is filled in by setup.py.
 //
 // After building, in Python:
-//   import activations_cuda as A
+import activations_cuda as A
 //   y = A.relu_fwd(x)
 // --------------------------------------------------------------------------
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
