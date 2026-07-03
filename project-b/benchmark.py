@@ -22,7 +22,7 @@ import torch
 import torch.utils.benchmark as benchmark
 
 # TODO: uncomment once you've built the extension with setup.py
-# import activations_cuda
+import activations_cuda
 
 # ---------------------------------------------------------------------------
 # Config
@@ -41,17 +41,13 @@ BENCH_ITERS  = 50
 # Familiarise yourself with the shapes: x is always (N,) — a flat 1-D tensor.
 
 def pt_relu(x: torch.Tensor) -> torch.Tensor:
-    # TODO: return torch.relu(x)   — or equivalently F.relu(x)
-    raise NotImplementedError
+    return torch.relu(x)
 
 def pt_silu(x: torch.Tensor) -> torch.Tensor:
-    # TODO: return torch.nn.functional.silu(x)
-    raise NotImplementedError
+    return torch.nn.functional.silu(x)
 
 def pt_gelu(x: torch.Tensor) -> torch.Tensor:
-    # TODO: return torch.nn.functional.gelu(x)
-    #       (PyTorch uses the exact erf-based formula by default)
-    raise NotImplementedError
+    return torch.nn.functional.gelu(x)
 
 # ---------------------------------------------------------------------------
 # torch.compile wrappers
@@ -69,9 +65,9 @@ def pt_gelu(x: torch.Tensor) -> torch.Tensor:
 
 # TODO: create compiled versions of each activation
 # e.g.:   compiled_relu = torch.compile(pt_relu)
-compiled_relu = None  # TODO
-compiled_silu = None  # TODO
-compiled_gelu = None  # TODO
+compiled_relu = torch.compile(pt_relu)
+compiled_silu = torch.compile(pt_silu)
+compiled_gelu = torch.compile(pt_gelu)
 
 # ---------------------------------------------------------------------------
 # Custom kernel wrappers
@@ -80,16 +76,13 @@ compiled_gelu = None  # TODO
 # call them here like normal Python functions.
 
 def custom_relu(x: torch.Tensor) -> torch.Tensor:
-    # TODO: return activations_cuda.relu_fwd(x)
-    raise NotImplementedError
+    return activations_cuda.relu_fwd(x)
 
 def custom_silu(x: torch.Tensor) -> torch.Tensor:
-    # TODO: return activations_cuda.silu_fwd(x)
-    raise NotImplementedError
+    return activations_cuda.silu_fwd(x)
 
 def custom_gelu(x: torch.Tensor) -> torch.Tensor:
-    # TODO: return activations_cuda.gelu_fwd(x)
-    raise NotImplementedError
+    return activations_cuda.gelu_fwd(x)
 
 # ---------------------------------------------------------------------------
 # Correctness check
@@ -102,9 +95,10 @@ def check_correctness(name: str, ref_fn, custom_fn, x: torch.Tensor) -> None:
     with torch.no_grad():
         ref = ref_fn(x)
         out = custom_fn(x)
-    # TODO: use torch.allclose to compare ref and out
-    # TODO: print PASS / FAIL with the max absolute difference
-    raise NotImplementedError
+        if (torch.allclose(ref, out, atol=1e-5)):
+            print("PASS")
+        else:
+            print("FAIL")
 
 # ---------------------------------------------------------------------------
 # Timing helper
