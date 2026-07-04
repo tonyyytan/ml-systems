@@ -282,29 +282,210 @@ __global__ void add_kernel(const float* __restrict__ x, const float* __restrict_
 }
 
 __global__ void layernorm_kernel(const float* __restrict__ x, const float* __restrict__ gamma, const float* __restrict__ beta, float* __restrict__ out, int rows, int C, float eps) {
-    
-    
-    
-    
-    
-    
-    
-    // TODO: implement — one block per row, use shared memory for reduction
-    // hint: each block handles one row; threads cooperate to compute mean/var
+
+    int r = blockIdx.x;
+
+    if (r >= rows) {
+        return;
+    }
+
+    int tid = threadIdx.x;
+
+    double thread_sum{};
+    double thread_sq_sum{};
+
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+
+    for (int col = tid; col < C / 4; col += blockDim.x) {
+        int global_idx = r * C / 4 + col;
+
+        float4 input = x4[global_idx];
+
+        double v1 = static_cast<double>(input.x);
+        double v2 = static_cast<double>(input.y);
+        double v3 = static_cast<double>(input.z);
+        double v4 = static_cast<double>(input.w);
+
+        thread_sum += v1 + v2 + v3 + v4;
+        thread_sq_sum += (v1 * v1 + v2 * v2 + v3 * v3 + v4 * v4);
+    }
+
+    int remainder_start = (C / 4) * 4;
+    int remainder_idx = remainder_start + tid;
+
+    if (remainder_idx < C) {
+        int global_idx = r * C + remainder_idx;
+        double val = static_cast<double>(x[global_idx]);
+        thread_sum += val;
+        thread_sq_sum += val * val;
+    }
+
+    thread_sum = warp_reduce_sum(thread_sum);
+    thread_sq_sum = warp_reduce_sum(thread_sq_sum);
+
+    __shared__ double shared_sum[32];
+    __shared__ double shared_sq_sum[32];
+
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+
+    if (lane_id == 0) {
+        shared_sum[warp_id] = thread_sum;
+        shared_sq_sum[warp_id] = thread_sq_sum;
+    }
+
+    __syncthreads();
+
+    __shared__ double final_mean;
+    __shared__ double final_var;
+
+    if (warp_id == 0) {
+        int num_warps = blockDim.x / 32;
+        double b_sum = (lane_id < num_warps) ? shared_sum[lane_id] : 0.0;
+        double b_sq_sum = (lane_id < num_warps) ? shared_sq_sum[lane_id] : 0.0;
+
+        b_sum = warp_reduce_sum(b_sum);
+        b_sq_sum = warp_reduce_sum(b_sq_sum);
+
+        if (lane_id == 0) {
+            final_mean = b_sum / C;
+            final_var = (b_sq_sum / C) - (final_mean * final_mean);
+            if (final_var < 0.0) {
+                final_var = 0.0;
+            }
+        }
+    }
+
+    __syncthreads();
+
+    float4* out4 = reinterpret_cast<float4*>(out);
+
+    float mean_f = static_cast<float>(final_mean);
+    float var_f = static_cast<float>(final_var);
+    float rsqrt_std = rsqrtf(var_f + eps);
+
+    for(int col = tid; col < C / 4; col += blockDim.x) {
+
+        int global_idx = r * C / 4 + col;
+        float4 result;
+        float4 input = x4[global_idx];
+        int scalar_col = col * 4;
+        result.x = gamma[scalar_col] * (input.x - mean_f) * rsqrt_std + beta[scalar_col];
+        result.y = gamma[scalar_col + 1] * (input.y - mean_f) * rsqrt_std + beta[scalar_col+ 1];
+        result.z = gamma[scalar_col+ 2] * (input.z - mean_f) * rsqrt_std + beta[scalar_col + 2];
+        result.w = gamma[scalar_col + 3] * (input.w - mean_f) * rsqrt_std + beta[scalar_col + 3];
+
+        out4[global_idx] = result;
+    }
+
+    if (remainder_idx < C) {
+        int global_idx = r * C + remainder_idx;
+        out[global_idx] = gamma[remainder_idx] * (x[global_idx] - mean_f) / std::sqrtf(var_f + eps) + beta[remainder_idx];
+    }
 }
 
 // ===========================================================================
 // Kernel 3b (fused): Add + LayerNorm — single kernel
 // ===========================================================================
 
-__global__ void add_layernorm_fused_kernel(const float* __restrict__ x,
-                                            const float* __restrict__ residual,
-                                            const float* __restrict__ gamma,
-                                            const float* __restrict__ beta,
-                                            float* __restrict__ out,
-                                            int rows, int C,
-                                            float eps) {
-    // TODO: implement — add residual and normalize in one pass
+__global__ void add_layernorm_fused_kernel(const float* __restrict__ x, const float* __restrict__ residual, const float* __restrict__ gamma, const float* __restrict__ beta, float* __restrict__ out, int rows, int C, float eps) {
+    int r = blockIdx.x;
+    int tid = threadIdx.x;
+
+    double thread_sum{};
+    double thread_sq_sum{};
+
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    const float4* r4 = reinterpret_cast<const float4*>(residual);
+
+    for(int col = tid; col < C / 4; col += blockDim.x) {
+        int global_idx = r * C / 4 + col;
+
+        float4 input = x4[global_idx];
+        float4 residual_input = r4[global_idx];
+
+        double v1 = static_cast<double>(input.x + residual_input.x);
+        double v2 = static_cast<double>(input.y + residual_input.y);
+        double v3 = static_cast<double>(input.z + residual_input.z);
+        double v4 = static_cast<double>(input.w + residual_input.w);
+
+        thread_sum += v1 + v2 + v3 + v4;
+        thread_sq_sum += v1 * v1 + v2 * v2 + v3 * v3 + v4 * v4;
+    }
+
+    int remainder_start = (C / 4) * 4;
+    int remainder_idx = remainder_start + tid;
+
+    if (remainder_idx < C) {
+        int global_idx = r * C + remainder_idx;
+        double val = static_cast<double>(x[global_idx] + residual[global_idx]);
+        thread_sum += val;
+        thread_sq_sum += val * val;
+    }
+
+    thread_sum = warp_reduce_sum(thread_sum);
+    thread_sq_sum = warp_reduce_sum(thread_sq_sum);
+
+    __shared__ double shared_sum[32];
+    __shared__ double shared_sq_sum[32];
+
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+
+    if (lane_id == 0) {
+        shared_sum[warp_id] = thread_sum;
+        shared_sq_sum[warp_id] = thread_sq_sum;
+    }
+
+    __syncthreads();
+
+    __shared__ double final_mean;
+    __shared__ double final_var;
+
+    if (warp_id == 0) {
+        int num_warps = blockDim.x / 32;
+        double b_sum = (lane_id < num_warps) ? shared_sum[lane_id] : 0.0;
+        double b_sq_sum = (lane_id < num_warps) ? shared_sq_sum[lane_id] : 0.0;
+
+        b_sum = warp_reduce_sum(b_sum);
+        b_sq_sum = warp_reduce_sum(b_sq_sum);
+
+        if (lane_id == 0) {
+            final_mean = b_sum / C;
+            final_var = b_sq_sum / C - (final_mean * final_mean);
+            if (final_var < 0.0) {
+                final_var = 0.0;
+            }
+        }
+    }
+
+    __syncthreads();
+
+    float mean_f = static_cast<float>(final_mean);
+    float var_f = static_cast<float>(final_var);
+    float4* out4 = reinterpret_cast<float4*>(out);
+
+    float rsqrt_std = rsqrtf(var_f + eps);
+
+    for(int col = tid; col < C / 4; col += blockDim.x) {
+        int global_idx = r * C / 4 + col;
+        int scalar_col = col * 4;
+        float4 input = x4[global_idx];
+        float4 residual_input = r4[global_idx];
+        float4 result;
+
+        result.x = gamma[scalar_col] * (input.x + residual_input.x - mean_f) * rsqrt_std + beta[scalar_col];
+        result.y = gamma[scalar_col + 1] * (input.y + residual_input.y - mean_f) * rsqrt_std + beta[scalar_col + 1];
+        result.z = gamma[scalar_col + 2] * (input.z + residual_input.z - mean_f) * rsqrt_std + beta[scalar_col + 2];
+        result.w = gamma[scalar_col + 3] * (input.w + residual_input.w - mean_f) * rsqrt_std + beta[scalar_col + 3];
+
+        out4[global_idx] = result;
+    }
+
+    if(remainder_idx < C) {
+        int global_idx = r * C + remainder_idx;
+        out[global_idx] = gamma[remainder_idx] * (x[global_idx] + residual[global_idx] - mean_f) / std::sqrtf(var_f + eps) + beta[remainder_idx];
+    }
 }
 
 void run_add_layernorm(int rows, int C) {
