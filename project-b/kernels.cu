@@ -1,39 +1,12 @@
 /*
- * Project B: CUDA operator fusion — benchmark three fused kernels vs unfused
- *            PyTorch equivalents to understand the memory bandwidth savings
- *            of operator fusion.
+ * Project B: CUDA operator fusion — benchmark fused kernels (ReLU, bias+GELU,
+ * add+LayerNorm) vs unfused equivalents.
  *
- * Kernels:
- *   1. ReLU            — baseline elementwise, trivially memory-bound
- *   2. Bias + GELU     — fuse bias add + GELU activation in one pass
- *   3. Add + LayerNorm — fuse residual add + layer norm (transformer block)
- *
- * For each kernel we compare:
- *   (a) unfused: separate CUDA kernels / PyTorch ops, each touching global mem
- *   (b) fused:   single kernel that reads once, writes once
- *
- * Build (standalone C++ benchmark):
- *   make
- *   ./kernels > results.csv
- *   python3 plot_fusion.py results.csv
- *
- * Build (PyTorch extension for benchmark.py):
- *   python setup.py build_ext --inplace
- *   python benchmark.py
- *
- * The file is split into three sections:
- *   A) Raw CUDA kernels          — __global__ functions, no PyTorch dependency
- *   B) Standalone C++ main()     — compiled by make, uses cudaMalloc directly
- *   C) PyTorch extension glue    — compiled by setup.py, exposes ops to Python
- *      (guarded by #ifdef TORCH_EXTENSION — set automatically by setup.py)
+ * Standalone benchmark:  make && ./kernels > results.csv && python3 plot_fusion.py results.csv
+ * PyTorch extension:     python setup.py build_ext --inplace && python benchmark.py
  */
 
-// ---------------------------------------------------------------------------
-// Includes
-// ---------------------------------------------------------------------------
-// When building the PyTorch extension, torch/extension.h must come first.
-// The #ifdef lets the same file compile both as a standalone binary (make)
-// and as a Python extension (setup.py).
+// torch/extension.h must come first when building the extension
 #ifdef TORCH_EXTENSION
 #include <torch/extension.h>
 #endif
@@ -47,14 +20,8 @@
 #include <vector>
 #include <algorithm>
 
-// ---------------------------------------------------------------------------
-// Hardware constants — RTX 5060 Laptop GPU (Blackwell GB206)
-// ---------------------------------------------------------------------------
-static constexpr double PEAK_BW_GB_S = 272.0;   // memory bandwidth GB/s
+static constexpr double PEAK_BW_GB_S = 272.0;   // RTX 5060 Laptop GPU (Blackwell GB206)
 
-// ---------------------------------------------------------------------------
-// Error-checking helpers
-// ---------------------------------------------------------------------------
 #define CUDA_CHECK(call)                                                          \
     do {                                                                          \
         cudaError_t _err = (call);                                                \
@@ -65,9 +32,7 @@ static constexpr double PEAK_BW_GB_S = 272.0;   // memory bandwidth GB/s
         }                                                                         \
     } while (0)
 
-// ---------------------------------------------------------------------------
-// Benchmark helper — returns median kernel time in milliseconds
-// ---------------------------------------------------------------------------
+// returns median kernel time in milliseconds
 template <typename Fn>
 double benchmark_ms(Fn&& fn, int warmup = 5, int iters = 20) {
     for (int i = 0; i < warmup; ++i) fn();
@@ -108,12 +73,12 @@ __global__ void relu_kernel(const float* __restrict__ x, float* __restrict__ y, 
 
     for(; i < N / 4; i+= stride) {
 
-        float4 data = x4[i];
-        data.x = fmaxf(0.0f, data.x);
-        data.y = fmaxf(0.0f, data.y);
-        data.z = fmaxf(0.0f, data.z);
-        data.w = fmaxf(0.0f, data.w);
-        y4[i] = data;
+        float4 vals = x4[i];
+        vals.x = fmaxf(0.0f, vals.x);
+        vals.y = fmaxf(0.0f, vals.y);
+        vals.z = fmaxf(0.0f, vals.z);
+        vals.w = fmaxf(0.0f, vals.w);
+        y4[i] = vals;
     }
 
     int remainder_start = (N / 4) * 4;
@@ -125,9 +90,44 @@ __global__ void relu_kernel(const float* __restrict__ x, float* __restrict__ y, 
 }
 
 void run_relu(int N) {
-    float *d_x, *d_y;
-    // TODO: allocate, fill, benchmark, print CSV row, free
-    (void)d_x; (void)d_y;
+    float *device_input, *device_output;
+    size_t bytes = static_cast<size_t>(N) * sizeof(float);
+
+    CUDA_CHECK(cudaMalloc(&device_input, bytes));
+    CUDA_CHECK(cudaMalloc(&device_output, bytes));
+
+    std::vector<float> host_input(N);
+    for (int i = 0; i < N; ++i) host_input[i] = static_cast<float>(i % 7) - 3.0f;
+    CUDA_CHECK(cudaMemcpy(device_input, host_input.data(), bytes, cudaMemcpyHostToDevice));
+
+    int threads = 256;
+    int vec_work = (N + 3) / 4;
+    int blocks = std::min((vec_work + threads - 1) / threads, 1024);
+    if (blocks < 1) blocks = 1;
+
+    relu_kernel<<<blocks, threads>>>(device_input, device_output, N);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<float> host_output(N);
+    CUDA_CHECK(cudaMemcpy(host_output.data(), device_output, bytes, cudaMemcpyDeviceToHost));
+    for (int i = 0; i < N; ++i) {
+        float expected = fmaxf(0.0f, host_input[i]);
+        if (host_output[i] != expected) {
+            fprintf(stderr, "relu mismatch at %d: got %f want %f\n", i, host_output[i], expected);
+            exit(1);
+        }
+    }
+
+    double ms = benchmark_ms([&]() {relu_kernel<<<blocks, threads>>>(device_input, device_output, N);});
+
+    double moved_bytes = 2.0 * static_cast<double>(bytes);
+    double bw_gb_s = moved_bytes / (ms * 1e-3) / 1e9;
+
+    printf("relu,fused,%d,0,%.5f,%.2f\n", N, ms, bw_gb_s);
+    fprintf(stderr, "  N=%8d  %.5f ms  %.1f GB/s  (%.0f%% of peak)\n", N, ms, bw_gb_s, 100.0 * bw_gb_s / PEAK_BW_GB_S);
+
+    CUDA_CHECK(cudaFree(device_input));
+    CUDA_CHECK(cudaFree(device_output));
 }
 
 // ===========================================================================
@@ -145,7 +145,7 @@ __global__ void bias_add_kernel(const float* __restrict__ x, const float* __rest
     float4* y4 = reinterpret_cast<float4*>(y);
 
     for(; i < N /4; i += stride) {
-        float4 input = x4[i];
+        float4 vals = x4[i];
 
         int raw_idx = i * 4;
 
@@ -155,10 +155,10 @@ __global__ void bias_add_kernel(const float* __restrict__ x, const float* __rest
         float bias_w = bias[(raw_idx + 3) % C];
 
         float4 result;
-        result.x = input.x + bias_x;
-        result.y = input.y + bias_y;
-        result.z = input.z + bias_z;
-        result.w = input.w + bias_w;
+        result.x = vals.x + bias_x;
+        result.y = vals.y + bias_y;
+        result.z = vals.z + bias_z;
+        result.w = vals.w + bias_w;
 
         y4[i] = result;
     }
@@ -178,13 +178,13 @@ __global__ void gelu_kernel(float* __restrict__ y, int N) {
     float4* y4 = reinterpret_cast<float4*>(y);
 
     for(; i < N / 4; i += stride) {
-        float4 input = y4[i];
+        float4 vals = y4[i];
         float4 result;
 
-        result.x = input.x * 0.5f * (1.0f + erff(input.x / std::sqrtf(2)));
-        result.y = input.y * 0.5f * (1.0f + erff(input.y / std::sqrtf(2)));
-        result.z = input.z * 0.5f * (1.0f + erff(input.z / std::sqrtf(2)));
-        result.w = input.w * 0.5f * (1.0f + erff(input.w / std::sqrtf(2)));
+        result.x = vals.x * 0.5f * (1.0f + erff(vals.x / std::sqrtf(2)));
+        result.y = vals.y * 0.5f * (1.0f + erff(vals.y / std::sqrtf(2)));
+        result.z = vals.z * 0.5f * (1.0f + erff(vals.z / std::sqrtf(2)));
+        result.w = vals.w * 0.5f * (1.0f + erff(vals.w / std::sqrtf(2)));
 
         y4[i] = result;
     }
@@ -209,14 +209,14 @@ __global__ void bias_gelu_fused_kernel(const float* __restrict__ x, const float*
     float4* y4 = reinterpret_cast<float4*>(y);
 
     for(; i < N / 4; i += stride) {
-        float4 input = x4[i];
+        float4 vals = x4[i];
         float4 result;
         int raw_idx = i * 4;
 
-        result.x = input.x + bias[raw_idx % C];
-        result.y = input.y + bias[(raw_idx + 1) % C];
-        result.z = input.z + bias[(raw_idx + 2) % C];
-        result.w = input.w + bias[(raw_idx + 3) % C];
+        result.x = vals.x + bias[raw_idx % C];
+        result.y = vals.y + bias[(raw_idx + 1) % C];
+        result.z = vals.z + bias[(raw_idx + 2) % C];
+        result.w = vals.w + bias[(raw_idx + 3) % C];
 
         result.x = result.x * 0.5f * (1.0f + erff(result.x / std::sqrtf(2)));
         result.y = result.y * 0.5f * (1.0f + erff(result.y / std::sqrtf(2)));
@@ -230,15 +230,15 @@ __global__ void bias_gelu_fused_kernel(const float* __restrict__ x, const float*
     int remainder_idx = remainder_start + blockDim.x * blockIdx.x + threadIdx.x;
 
     if (remainder_idx < N) {
-        float temp = x[remainder_idx] + bias[remainder_idx % C];
-        y[remainder_idx] = temp * 0.5f * (1.0f + erff(temp / std::sqrtf(2)));
+        float biased = x[remainder_idx] + bias[remainder_idx % C];
+        y[remainder_idx] = biased * 0.5f * (1.0f + erff(biased / std::sqrtf(2)));
     }
 }
 
 void run_bias_gelu(int N, int C) {
-    float *d_x, *d_bias, *d_y;
+    float *device_input, *device_bias, *device_output;
     // TODO: allocate, benchmark unfused vs fused, print CSV rows, free
-    (void)d_x; (void)d_bias; (void)d_y;
+    (void)device_input; (void)device_bias; (void)device_output;
 }
 
 // ===========================================================================
@@ -257,25 +257,25 @@ __global__ void add_kernel(const float* __restrict__ x, const float* __restrict_
     int stride = blockDim.x * gridDim.x;
 
     const float4* x4 = reinterpret_cast<const float4*>(x);
-    const float4* r4 = reinterpret_cast<const float*4>(residual);
+    const float4* r4 = reinterpret_cast<const float4*>(residual);
     float4* out4 = reinterpret_cast<float4*>(out);
 
     for(; i < N / 4; i +=stride) {
-        float4 input = x4[i];
-        float4 res = r4[i];
-        float4 output;
+        float4 vals = x4[i];
+        float4 res_vals = r4[i];
+        float4 result;
 
-        output.x = input.x + res.x;
-        output.y = input.y + res.y;
-        output.z = input.z + res.z;
-        output.w = input.w + res.w;
-        
-        out4[i] = output;
+        result.x = vals.x + res_vals.x;
+        result.y = vals.y + res_vals.y;
+        result.z = vals.z + res_vals.z;
+        result.w = vals.w + res_vals.w;
+
+        out4[i] = result;
     }
 
     int remainder_start = (N / 4) * 4;
     int remainder_idx = remainder_start + blockIdx.x * blockDim.x + threadIdx.x;
-    
+
     if (remainder_idx < N) {
         out[remainder_idx] = x[remainder_idx] + residual[remainder_idx];
     }
@@ -299,12 +299,12 @@ __global__ void layernorm_kernel(const float* __restrict__ x, const float* __res
     for (int col = tid; col < C / 4; col += blockDim.x) {
         int global_idx = r * C / 4 + col;
 
-        float4 input = x4[global_idx];
+        float4 vals = x4[global_idx];
 
-        double v1 = static_cast<double>(input.x);
-        double v2 = static_cast<double>(input.y);
-        double v3 = static_cast<double>(input.z);
-        double v4 = static_cast<double>(input.w);
+        double v1 = static_cast<double>(vals.x);
+        double v2 = static_cast<double>(vals.y);
+        double v3 = static_cast<double>(vals.z);
+        double v4 = static_cast<double>(vals.w);
 
         thread_sum += v1 + v2 + v3 + v4;
         thread_sq_sum += (v1 * v1 + v2 * v2 + v3 * v3 + v4 * v4);
@@ -341,15 +341,15 @@ __global__ void layernorm_kernel(const float* __restrict__ x, const float* __res
 
     if (warp_id == 0) {
         int num_warps = blockDim.x / 32;
-        double b_sum = (lane_id < num_warps) ? shared_sum[lane_id] : 0.0;
-        double b_sq_sum = (lane_id < num_warps) ? shared_sq_sum[lane_id] : 0.0;
+        double block_sum = (lane_id < num_warps) ? shared_sum[lane_id] : 0.0;
+        double block_sq_sum = (lane_id < num_warps) ? shared_sq_sum[lane_id] : 0.0;
 
-        b_sum = warp_reduce_sum(b_sum);
-        b_sq_sum = warp_reduce_sum(b_sq_sum);
+        block_sum = warp_reduce_sum(block_sum);
+        block_sq_sum = warp_reduce_sum(block_sq_sum);
 
         if (lane_id == 0) {
-            final_mean = b_sum / C;
-            final_var = (b_sq_sum / C) - (final_mean * final_mean);
+            final_mean = block_sum / C;
+            final_var = (block_sq_sum / C) - (final_mean * final_mean);
             if (final_var < 0.0) {
                 final_var = 0.0;
             }
@@ -368,12 +368,12 @@ __global__ void layernorm_kernel(const float* __restrict__ x, const float* __res
 
         int global_idx = r * C / 4 + col;
         float4 result;
-        float4 input = x4[global_idx];
+        float4 vals = x4[global_idx];
         int scalar_col = col * 4;
-        result.x = gamma[scalar_col] * (input.x - mean_f) * rsqrt_std + beta[scalar_col];
-        result.y = gamma[scalar_col + 1] * (input.y - mean_f) * rsqrt_std + beta[scalar_col+ 1];
-        result.z = gamma[scalar_col+ 2] * (input.z - mean_f) * rsqrt_std + beta[scalar_col + 2];
-        result.w = gamma[scalar_col + 3] * (input.w - mean_f) * rsqrt_std + beta[scalar_col + 3];
+        result.x = gamma[scalar_col] * (vals.x - mean_f) * rsqrt_std + beta[scalar_col];
+        result.y = gamma[scalar_col + 1] * (vals.y - mean_f) * rsqrt_std + beta[scalar_col+ 1];
+        result.z = gamma[scalar_col+ 2] * (vals.z - mean_f) * rsqrt_std + beta[scalar_col + 2];
+        result.w = gamma[scalar_col + 3] * (vals.w - mean_f) * rsqrt_std + beta[scalar_col + 3];
 
         out4[global_idx] = result;
     }
@@ -401,13 +401,13 @@ __global__ void add_layernorm_fused_kernel(const float* __restrict__ x, const fl
     for(int col = tid; col < C / 4; col += blockDim.x) {
         int global_idx = r * C / 4 + col;
 
-        float4 input = x4[global_idx];
-        float4 residual_input = r4[global_idx];
+        float4 vals = x4[global_idx];
+        float4 res_vals = r4[global_idx];
 
-        double v1 = static_cast<double>(input.x + residual_input.x);
-        double v2 = static_cast<double>(input.y + residual_input.y);
-        double v3 = static_cast<double>(input.z + residual_input.z);
-        double v4 = static_cast<double>(input.w + residual_input.w);
+        double v1 = static_cast<double>(vals.x + res_vals.x);
+        double v2 = static_cast<double>(vals.y + res_vals.y);
+        double v3 = static_cast<double>(vals.z + res_vals.z);
+        double v4 = static_cast<double>(vals.w + res_vals.w);
 
         thread_sum += v1 + v2 + v3 + v4;
         thread_sq_sum += v1 * v1 + v2 * v2 + v3 * v3 + v4 * v4;
@@ -444,15 +444,15 @@ __global__ void add_layernorm_fused_kernel(const float* __restrict__ x, const fl
 
     if (warp_id == 0) {
         int num_warps = blockDim.x / 32;
-        double b_sum = (lane_id < num_warps) ? shared_sum[lane_id] : 0.0;
-        double b_sq_sum = (lane_id < num_warps) ? shared_sq_sum[lane_id] : 0.0;
+        double block_sum = (lane_id < num_warps) ? shared_sum[lane_id] : 0.0;
+        double block_sq_sum = (lane_id < num_warps) ? shared_sq_sum[lane_id] : 0.0;
 
-        b_sum = warp_reduce_sum(b_sum);
-        b_sq_sum = warp_reduce_sum(b_sq_sum);
+        block_sum = warp_reduce_sum(block_sum);
+        block_sq_sum = warp_reduce_sum(block_sq_sum);
 
         if (lane_id == 0) {
-            final_mean = b_sum / C;
-            final_var = b_sq_sum / C - (final_mean * final_mean);
+            final_mean = block_sum / C;
+            final_var = block_sq_sum / C - (final_mean * final_mean);
             if (final_var < 0.0) {
                 final_var = 0.0;
             }
@@ -470,14 +470,14 @@ __global__ void add_layernorm_fused_kernel(const float* __restrict__ x, const fl
     for(int col = tid; col < C / 4; col += blockDim.x) {
         int global_idx = r * C / 4 + col;
         int scalar_col = col * 4;
-        float4 input = x4[global_idx];
-        float4 residual_input = r4[global_idx];
+        float4 vals = x4[global_idx];
+        float4 res_vals = r4[global_idx];
         float4 result;
 
-        result.x = gamma[scalar_col] * (input.x + residual_input.x - mean_f) * rsqrt_std + beta[scalar_col];
-        result.y = gamma[scalar_col + 1] * (input.y + residual_input.y - mean_f) * rsqrt_std + beta[scalar_col + 1];
-        result.z = gamma[scalar_col + 2] * (input.z + residual_input.z - mean_f) * rsqrt_std + beta[scalar_col + 2];
-        result.w = gamma[scalar_col + 3] * (input.w + residual_input.w - mean_f) * rsqrt_std + beta[scalar_col + 3];
+        result.x = gamma[scalar_col] * (vals.x + res_vals.x - mean_f) * rsqrt_std + beta[scalar_col];
+        result.y = gamma[scalar_col + 1] * (vals.y + res_vals.y - mean_f) * rsqrt_std + beta[scalar_col + 1];
+        result.z = gamma[scalar_col + 2] * (vals.z + res_vals.z - mean_f) * rsqrt_std + beta[scalar_col + 2];
+        result.w = gamma[scalar_col + 3] * (vals.w + res_vals.w - mean_f) * rsqrt_std + beta[scalar_col + 3];
 
         out4[global_idx] = result;
     }
@@ -489,78 +489,35 @@ __global__ void add_layernorm_fused_kernel(const float* __restrict__ x, const fl
 }
 
 void run_add_layernorm(int rows, int C) {
-    float *d_x, *d_residual, *d_gamma, *d_beta, *d_out;
+    float *device_input, *device_residual, *device_gamma, *device_beta, *device_output;
     // TODO: allocate, benchmark unfused vs fused, print CSV rows, free
-    (void)d_x; (void)d_residual; (void)d_gamma; (void)d_beta; (void)d_out;
+    (void)device_input; (void)device_residual; (void)device_gamma; (void)device_beta; (void)device_output;
 }
 
 // ===========================================================================
-// SECTION C: PyTorch C++ Extension
-//
-// Only compiled when building via setup.py (which defines TORCH_EXTENSION).
-// This section exposes the raw CUDA kernels above to Python via pybind11.
-//
-// Key concepts:
-//
-//   at::Tensor          — the PyTorch tensor type in C++
-//   tensor.data_ptr<scalar_t>()   — raw pointer to the underlying data
-//   tensor.numel()      — total number of elements (like .numel() in Python)
-//   tensor.contiguous() — ensures elements are laid out without gaps/strides
-//   at::empty_like(x)   — allocate output with same shape/dtype/device as x
-//
-//   AT_DISPATCH_FLOATING_TYPES_AND_HALF(dtype, "name", [&]() {
-//       using scalar_t = ...;  // float or at::Half, resolved at runtime
-//       // launch kernel using scalar_t pointers
-//   });
-//
-//   Kernel launch syntax (reminder):
-//       int threads = 256;
-//       int blocks  = (N + threads - 1) / threads;   // ceil(N / threads)
-//       my_kernel<<<blocks, threads>>>(args...);
-//
-//   TORCH_CHECK(condition, "error message")  — like assert but for PyTorch ops
+// SECTION C: PyTorch C++ extension — built by setup.py (defines
+// TORCH_EXTENSION), exposes the kernels to Python via pybind11
 // ===========================================================================
 #ifdef TORCH_EXTENSION
 
-// --------------------------------------------------------------------------
-// relu_fwd: wraps relu_kernel
-// --------------------------------------------------------------------------
 at::Tensor relu_fwd(at::Tensor x) {
-    // TODO:
-    //   1. TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor")
-    //   2. x = x.contiguous()
-    //   3. auto y = at::empty_like(x)
-    //   4. int N = x.numel()
-    //   5. int threads = 256, blocks = (N + threads - 1) / threads
-    //   6. AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), "relu_fwd", [&]() {
-    //          relu_kernel<<<blocks, threads>>>(
-    //              x.data_ptr<scalar_t>(), y.data_ptr<scalar_t>(), N);
-    //      });
-    //   7. return y
-    return x; // placeholder — remove once implemented
+    // TODO: TORCH_CHECK(x.is_cuda()), x.contiguous(), y = at::empty_like(x),
+    //       launch relu_kernel on x.data_ptr<float>(), return y
+    return x;
 }
 
-// --------------------------------------------------------------------------
-// TODO: gelu_fwd — wraps gelu_kernel (unfused, no bias)
-// --------------------------------------------------------------------------
 at::Tensor gelu_fwd(at::Tensor x) {
     // TODO: same structure as relu_fwd but calling gelu_kernel
     return x;
 }
 
-// --------------------------------------------------------------------------
-// TODO: bias_gelu_fwd — wraps bias_gelu_fused_kernel
-//   Takes x (N,) and bias (C,) where N is divisible by C
-// --------------------------------------------------------------------------
+// x (N,), bias (C,) where N is divisible by C
 at::Tensor bias_gelu_fwd(at::Tensor x, at::Tensor bias) {
     // TODO
     return x;
 }
 
-// --------------------------------------------------------------------------
-// TODO: add_layernorm_fwd — wraps add_layernorm_fused_kernel
-//   Takes x (rows, C), residual (rows, C), gamma (C,), beta (C,), eps
-// --------------------------------------------------------------------------
+// x (rows, C), residual (rows, C), gamma (C,), beta (C,)
 at::Tensor add_layernorm_fwd(at::Tensor x, at::Tensor residual,
                               at::Tensor gamma, at::Tensor beta,
                               float eps) {
@@ -568,16 +525,7 @@ at::Tensor add_layernorm_fwd(at::Tensor x, at::Tensor residual,
     return x;
 }
 
-// --------------------------------------------------------------------------
-// Module registration
-//
-// PYBIND11_MODULE(name, m) { m.def(...) } is the pybind11 way to expose
-// C++ functions to Python. TORCH_EXTENSION_NAME is filled in by setup.py.
-//
-// After building, in Python:
-import activations_cuda as A
-//   y = A.relu_fwd(x)
-// --------------------------------------------------------------------------
+// TORCH_EXTENSION_NAME is set by setup.py; in Python: import activations_cuda
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "Project B: fused activation CUDA kernels";
 
@@ -593,23 +541,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 
 // ===========================================================================
-// SECTION B: Standalone C++ entry point (compiled by make, not setup.py)
+// SECTION B: standalone entry point (compiled by make, not setup.py)
 // ===========================================================================
 #ifndef TORCH_EXTENSION
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
 int main() {
     int device = 0;
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
     fprintf(stderr, "Device: %s\n", prop.name);
 
-    // Print CSV header
     printf("kernel,variant,N,C,time_ms,bw_gb_s\n");
 
-    // Sweep sizes
     std::vector<int> sizes = {1 << 14, 1 << 16, 1 << 18, 1 << 20, 1 << 22};
 
     fprintf(stderr, "Kernel 1: ReLU...\n");
