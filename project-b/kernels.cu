@@ -181,10 +181,10 @@ __global__ void gelu_kernel(float* __restrict__ y, int N) {
         float4 vals = y4[i];
         float4 result;
 
-        result.x = vals.x * 0.5f * (1.0f + erff(vals.x / std::sqrtf(2)));
-        result.y = vals.y * 0.5f * (1.0f + erff(vals.y / std::sqrtf(2)));
-        result.z = vals.z * 0.5f * (1.0f + erff(vals.z / std::sqrtf(2)));
-        result.w = vals.w * 0.5f * (1.0f + erff(vals.w / std::sqrtf(2)));
+        result.x = vals.x * 0.5f * (1.0f + erff(vals.x / sqrtf(2)));
+        result.y = vals.y * 0.5f * (1.0f + erff(vals.y / sqrtf(2)));
+        result.z = vals.z * 0.5f * (1.0f + erff(vals.z / sqrtf(2)));
+        result.w = vals.w * 0.5f * (1.0f + erff(vals.w / sqrtf(2)));
 
         y4[i] = result;
     }
@@ -193,7 +193,7 @@ __global__ void gelu_kernel(float* __restrict__ y, int N) {
     int remainder_idx = remainder_start + blockDim.x * blockIdx.x + threadIdx.x;
 
     if (remainder_idx < N) {
-        y[remainder_idx] = y[remainder_idx] * 0.5f * (1.0f + erff(y[remainder_idx] / std::sqrtf(2)));
+        y[remainder_idx] = y[remainder_idx] * 0.5f * (1.0f + erff(y[remainder_idx] / sqrtf(2)));
     }
 }
 
@@ -218,10 +218,10 @@ __global__ void bias_gelu_fused_kernel(const float* __restrict__ x, const float*
         result.z = vals.z + bias[(raw_idx + 2) % C];
         result.w = vals.w + bias[(raw_idx + 3) % C];
 
-        result.x = result.x * 0.5f * (1.0f + erff(result.x / std::sqrtf(2)));
-        result.y = result.y * 0.5f * (1.0f + erff(result.y / std::sqrtf(2)));
-        result.z = result.z * 0.5f * (1.0f + erff(result.z / std::sqrtf(2)));
-        result.w = result.w * 0.5f * (1.0f + erff(result.w / std::sqrtf(2)));
+        result.x = result.x * 0.5f * (1.0f + erff(result.x / sqrtf(2)));
+        result.y = result.y * 0.5f * (1.0f + erff(result.y / sqrtf(2)));
+        result.z = result.z * 0.5f * (1.0f + erff(result.z / sqrtf(2)));
+        result.w = result.w * 0.5f * (1.0f + erff(result.w / sqrtf(2)));
 
         y4[i] = result;
     }
@@ -231,7 +231,7 @@ __global__ void bias_gelu_fused_kernel(const float* __restrict__ x, const float*
 
     if (remainder_idx < N) {
         float biased = x[remainder_idx] + bias[remainder_idx % C];
-        y[remainder_idx] = biased * 0.5f * (1.0f + erff(biased / std::sqrtf(2)));
+        y[remainder_idx] = biased * 0.5f * (1.0f + erff(biased / sqrtf(2)));
     }
 }
 
@@ -251,6 +251,12 @@ void run_bias_gelu(int N, int C) {
 //     var   = sum((row - mean)^2) / C
 //     out[r,c] = gamma[c] * (row[c] - mean) / sqrt(var + eps) + beta[c]
 // ===========================================================================
+
+__device__ __forceinline__ double warp_reduce_sum(double v) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+        v += __shfl_down_sync(0xffffffff, v, offset);
+    return v;
+}
 
 __global__ void add_kernel(const float* __restrict__ x, const float* __restrict__ residual, float* __restrict__ out, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -380,7 +386,7 @@ __global__ void layernorm_kernel(const float* __restrict__ x, const float* __res
 
     if (remainder_idx < C) {
         int global_idx = r * C + remainder_idx;
-        out[global_idx] = gamma[remainder_idx] * (x[global_idx] - mean_f) / std::sqrtf(var_f + eps) + beta[remainder_idx];
+        out[global_idx] = gamma[remainder_idx] * (x[global_idx] - mean_f) / sqrtf(var_f + eps) + beta[remainder_idx];
     }
 }
 
@@ -484,7 +490,7 @@ __global__ void add_layernorm_fused_kernel(const float* __restrict__ x, const fl
 
     if(remainder_idx < C) {
         int global_idx = r * C + remainder_idx;
-        out[global_idx] = gamma[remainder_idx] * (x[global_idx] + residual[global_idx] - mean_f) / std::sqrtf(var_f + eps) + beta[remainder_idx];
+        out[global_idx] = gamma[remainder_idx] * (x[global_idx] + residual[global_idx] - mean_f) / sqrtf(var_f + eps) + beta[remainder_idx];
     }
 }
 
