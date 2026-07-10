@@ -1,6 +1,6 @@
 # Build outputs
-project-a/roofline
-project-a/*.o
+01-matmul-roofline/roofline
+*.o
 
 # CUDA intermediates
 *.ptx
