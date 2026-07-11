@@ -15,8 +15,8 @@ setup(
             name="activations_cuda",
             sources=["kernels.cu"],
             extra_compile_args={
-                "cxx": ["-03", "-std=c++17"],
-                "nvcc": ["-03", "-arch=sm_120", "-std=c++17", "-diag-suppress=177"]
+                "cxx": ["-O3", "-std=c++17", "-DTORCH_EXTENSION"],
+                "nvcc": ["-O3", "-arch=sm_120", "-std=c++17", "-diag-suppress=177", "-DTORCH_EXTENSION"]
             }
         )
     ],

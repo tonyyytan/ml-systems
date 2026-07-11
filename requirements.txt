@@ -1,1 +1,26 @@
-matplotlib
+# ml-systems — Python dependencies (pip). Install into the repo venv:
+#   .venv/bin/pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu128
+#
+# requirements.txt cannot capture the whole toolchain. Building the CUDA
+# extensions (setup.py) also needs SYSTEM pieces that pip cannot install.
+# Known-good stack on this machine (2026-07, RTX 5060 Laptop, Blackwell sm_120):
+#
+# System (install first, outside pip):
+#   - NVIDIA driver        592.25   (nvidia-smi)
+#   - CUDA toolkit (nvcc)  12.9     (nvcc --version) — picks the cu12x wheel below
+#   - python3-dev          3.12.x   provides Python.h — sudo apt install python3-dev
+#   - build-essential (g++)         sudo apt install build-essential
+#
+# Python 3.12 (wheels below are cp312; a different Python needs different wheels).
+#
+# Version-matching rule:
+#   torch's CUDA MAJOR version must equal the local nvcc MAJOR version.
+#   nvcc is 12.9, so use a cu12x wheel (cu128). The default PyPI torch is cu13x
+#   and will fail the extension build. Minor gaps (12.8 vs 12.9) are fine; only
+#   the major (12 vs 13) must match.
+
+torch==2.11.0
+numpy==2.4.6
+matplotlib==3.11.0
+setuptools==83.0.0
+ninja==1.13.0
