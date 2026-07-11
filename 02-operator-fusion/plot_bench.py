@@ -1,11 +1,11 @@
 """
-Reads results.csv produced by ./kernels and saves fusion_benchmark.png.
+Reads results.csv produced by benchmark.py and saves bench_benchmark.png.
 
 Usage:
-    python3 plot_fusion.py results.csv
+    python3 plot_bench.py results.csv
 
 CSV format:
-    kernel,variant,N,C,time_ms,bw_gb_s
+    op,variant,N,time_ms,bw_gb_s
 """
 
 import sys
@@ -16,30 +16,30 @@ import matplotlib.ticker as ticker
 
 # Style per variant
 VARIANT_STYLE = {
-    "unfused": {"linestyle": "--", "marker": "o"},
-    "fused":   {"linestyle": "-",  "marker": "^"},
-    "pytorch": {"linestyle": ":",  "marker": "s"},
+    "eager":   {"linestyle": ":",  "marker": "s"},
+    "compile": {"linestyle": "--", "marker": "o"},
+    "custom":  {"linestyle": "-",  "marker": "^"},
 }
 
-# Color per kernel
-KERNEL_COLOR = {
-    "relu":           "#4C72B0",
-    "bias_gelu":      "#DD8452",
-    "add_layernorm":  "#55A868",
+# Color per op
+OP_COLOR = {
+    "relu":          "#4C72B0",
+    "bias_gelu":     "#DD8452",
+    "add_layernorm": "#55A868",
 }
 
 def load_csv(path):
-    # rows[kernel][variant] = [(N, bw)]
-    rows = defaultdict(lambda: defaultdict(list))
+    # data[op][variant] = [(N, bw)]
+    data = defaultdict(lambda: defaultdict(list))
     with open(path) as f:
         reader = csv.DictReader(f)
         for row in reader:
-            kernel  = row["kernel"]
+            op      = row["op"]
             variant = row["variant"]
             N       = int(row["N"])
             bw      = float(row["bw_gb_s"])
-            rows[kernel][variant].append((N, bw))
-    return rows
+            data[op][variant].append((N, bw))
+    return data
 
 def plot(csv_path):
     data = load_csv(csv_path)
@@ -51,8 +51,8 @@ def plot(csv_path):
     # GB/s RTX 5060 laptop
     peak_bw = 272.0
 
-    for ax, (kernel, variants) in zip(axes, data.items()):
-        color = KERNEL_COLOR.get(kernel, None)
+    for ax, (op, variants) in zip(axes, data.items()):
+        color = OP_COLOR.get(op, None)
         ax.axhline(peak_bw, color="red", linewidth=1, linestyle="--", label="Peak BW")
 
         for variant, points in sorted(variants.items()):
@@ -65,13 +65,13 @@ def plot(csv_path):
         ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f"{int(v):,}"))
         ax.set_xlabel("N (elements)", fontsize=11)
         ax.set_ylabel("Effective BW  (GB/s)", fontsize=11)
-        ax.set_title(kernel.replace("_", " ").title(), fontsize=12)
+        ax.set_title(op.replace("_", " ").title(), fontsize=12)
         ax.legend(fontsize=9)
         ax.grid(True, which="both", linestyle="--", linewidth=0.4, alpha=0.6)
 
-    fig.suptitle("Operator Fusion Benchmark — RTX 5060 Laptop GPU", fontsize=13)
+    fig.suptitle("Eager vs torch.compile vs Custom Kernel — RTX 5060 Laptop GPU", fontsize=13)
     fig.tight_layout()
-    out = "fusion_benchmark.png"
+    out = "bench_benchmark.png"
     fig.savefig(out, dpi=150)
     print(f"Saved {out}")
 
