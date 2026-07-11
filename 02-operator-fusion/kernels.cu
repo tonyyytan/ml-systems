@@ -20,7 +20,8 @@
 #include <vector>
 #include <algorithm>
 
-static constexpr double PEAK_BW_GB_S = 272.0;   // RTX 5060 Laptop GPU (Blackwell GB206)
+// RTX 5060 Laptop GPU (Blackwell GB206)
+static constexpr double PEAK_BW_GB_S = 272.0;
 
 #define CUDA_CHECK(call)                                                          \
     do {                                                                          \
@@ -237,8 +238,67 @@ __global__ void bias_gelu_fused_kernel(const float* __restrict__ x, const float*
 
 void run_bias_gelu(int N, int C) {
     float *device_input, *device_bias, *device_output;
-    // TODO: allocate, benchmark unfused vs fused, print CSV rows, free
-    (void)device_input; (void)device_bias; (void)device_output;
+
+    size_t input_bytes = static_cast<size_t>(N) * sizeof(float);
+    size_t bias_bytes = static_cast<size_t>(C) * sizeof(float);
+    CUDA_CHECK(cudaMalloc(&device_input, input_bytes));
+    CUDA_CHECK(cudaMalloc(&device_bias, bias_bytes));
+    CUDA_CHECK(cudaMalloc(&device_output, input_bytes));
+
+    std::vector<float> host_input(N);
+    std::vector<float> host_bias(C);
+
+    for (int i = 0; i < N; ++i) host_input[i] = static_cast<float>(i % 7) - 3.0f;
+    for (int i = 0; i < C; ++i) host_bias[i] = static_cast<float>(i % 5) * 0.1f - 0.2f;
+
+    CUDA_CHECK(cudaMemcpy(device_input, host_input.data(), input_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_bias, host_bias.data(), bias_bytes, cudaMemcpyHostToDevice));
+
+    int threads = 256;
+    int vec_work = (N + 3) / 4;
+    int blocks = std::min((vec_work + threads - 1) / threads, 1024);
+    if (blocks < 1) blocks = 1;
+
+    // check correctness: fused kernel vs CPU reference gelu(x + bias)
+    bias_gelu_fused_kernel<<<blocks, threads>>>(device_input, device_bias, device_output, N, C);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<float> host_output(N);
+    CUDA_CHECK(cudaMemcpy(host_output.data(), device_output, input_bytes, cudaMemcpyDeviceToHost));
+    for (int i = 0; i < N; ++i) {
+        float v = host_input[i] + host_bias[i % C];
+        float expected = v * 0.5f * (1.0f + erff(v / sqrtf(2.0f)));
+        if (fabsf(host_output[i] - expected) > 1e-3f) {
+            fprintf(stderr, "bias_gelu mismatch at %d: got %f want %f\n", i, host_output[i], expected);
+            exit(1);
+        }
+    }
+
+    // ideal traffic (read x, write y, read bias once) is charged the same to both
+    // variants; the unfused path's extra round trip shows up as lower effective BW.
+    double ideal_bytes = static_cast<double>(2.0 * N + C) * sizeof(float);
+
+    // unfused: bias add, then a separate pass for gelu
+    double ms_unfused = benchmark_ms([&]() {
+        bias_add_kernel<<<blocks, threads>>>(device_input, device_bias, device_output, N, C);
+        gelu_kernel<<<blocks, threads>>>(device_output, N);
+    });
+    double bw_unfused = ideal_bytes / (ms_unfused * 1e-3) / 1e9;
+    printf("bias_gelu,unfused,%d,%d,%.5f,%.2f\n", N, C, ms_unfused, bw_unfused);
+
+    // fused: single pass
+    double ms_fused = benchmark_ms([&]() {
+        bias_gelu_fused_kernel<<<blocks, threads>>>(device_input, device_bias, device_output, N, C);
+    });
+    double bw_fused = ideal_bytes / (ms_fused * 1e-3) / 1e9;
+    printf("bias_gelu,fused,%d,%d,%.5f,%.2f\n", N, C, ms_fused, bw_fused);
+
+    fprintf(stderr, "  N=%8d  unfused %.5f ms (%.1f GB/s)  fused %.5f ms (%.1f GB/s)\n",
+            N, ms_unfused, bw_unfused, ms_fused, bw_fused);
+
+    CUDA_CHECK(cudaFree(device_input));
+    CUDA_CHECK(cudaFree(device_bias));
+    CUDA_CHECK(cudaFree(device_output));
 }
 
 // ===========================================================================
@@ -495,9 +555,97 @@ __global__ void add_layernorm_fused_kernel(const float* __restrict__ x, const fl
 }
 
 void run_add_layernorm(int rows, int C) {
-    float *device_input, *device_residual, *device_gamma, *device_beta, *device_output;
-    // TODO: allocate, benchmark unfused vs fused, print CSV rows, free
-    (void)device_input; (void)device_residual; (void)device_gamma; (void)device_beta; (void)device_output;
+    int N = rows * C;
+    float *device_input, *device_residual, *device_gamma, *device_beta, *device_tmp, *device_output;
+    size_t bytes = static_cast<size_t>(N) * sizeof(float);
+    size_t param_bytes = static_cast<size_t>(C) * sizeof(float);
+    float eps = 1e-5f;
+
+    CUDA_CHECK(cudaMalloc(&device_input, bytes));
+    CUDA_CHECK(cudaMalloc(&device_residual, bytes));
+    CUDA_CHECK(cudaMalloc(&device_gamma, param_bytes));
+    CUDA_CHECK(cudaMalloc(&device_beta, param_bytes));
+    // device_tmp holds the intermediate for the unfused path
+    CUDA_CHECK(cudaMalloc(&device_tmp, bytes));
+    CUDA_CHECK(cudaMalloc(&device_output, bytes));
+
+    std::vector<float> host_input(N), host_residual(N);
+    for (int i = 0; i < N; ++i) {
+        host_input[i]    = static_cast<float>(i % 13) * 0.1f - 0.6f;
+        host_residual[i] = static_cast<float>(i % 7)  * 0.1f - 0.3f;
+    }
+    std::vector<float> host_gamma(C), host_beta(C);
+    for (int i = 0; i < C; ++i) {
+        host_gamma[i] = 1.0f;
+        host_beta[i]  = 0.0f;
+    }
+
+    CUDA_CHECK(cudaMemcpy(device_input,    host_input.data(),    bytes,       cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_residual, host_residual.data(), bytes,       cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_gamma,    host_gamma.data(),    param_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_beta,     host_beta.data(),     param_bytes, cudaMemcpyHostToDevice));
+
+    // layernorm kernels launch one block per row; the add kernel is a flat grid-stride loop
+    int threads = 256;
+    int add_vec_work = (N + 3) / 4;
+    int add_blocks = std::min((add_vec_work + threads - 1) / threads, 1024);
+    if (add_blocks < 1) add_blocks = 1;
+
+    // correctness: fused kernel vs CPU reference layernorm(x + residual)
+    add_layernorm_fused_kernel<<<rows, threads>>>(device_input, device_residual, device_gamma, device_beta, device_output, rows, C, eps);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<float> host_output(N);
+    CUDA_CHECK(cudaMemcpy(host_output.data(), device_output, bytes, cudaMemcpyDeviceToHost));
+    for (int r = 0; r < rows; ++r) {
+        double mean = 0.0, sq = 0.0;
+        for (int c = 0; c < C; ++c) {
+            double v = static_cast<double>(host_input[r * C + c]) + host_residual[r * C + c];
+            mean += v;
+            sq   += v * v;
+        }
+        mean /= C;
+        double var = sq / C - mean * mean;
+        if (var < 0.0) var = 0.0;
+        double inv_std = 1.0 / sqrt(var + eps);
+        for (int c = 0; c < C; ++c) {
+            double v = static_cast<double>(host_input[r * C + c]) + host_residual[r * C + c];
+            float expected = static_cast<float>(host_gamma[c] * (v - mean) * inv_std + host_beta[c]);
+            if (fabsf(host_output[r * C + c] - expected) > 1e-2f) {
+                fprintf(stderr, "add_layernorm mismatch at row %d col %d: got %f want %f\n",
+                        r, c, host_output[r * C + c], expected);
+                exit(1);
+            }
+        }
+    }
+
+    // ideal traffic: read x + residual, write out, read gamma + beta once
+    double ideal_bytes = static_cast<double>(3.0 * N + 2.0 * C) * sizeof(float);
+
+    // unfused: residual add into a temp buffer, then a separate layernorm pass
+    double ms_unfused = benchmark_ms([&]() {
+        add_kernel<<<add_blocks, threads>>>(device_input, device_residual, device_tmp, N);
+        layernorm_kernel<<<rows, threads>>>(device_tmp, device_gamma, device_beta, device_output, rows, C, eps);
+    });
+    double bw_unfused = ideal_bytes / (ms_unfused * 1e-3) / 1e9;
+    printf("add_layernorm,unfused,%d,%d,%.5f,%.2f\n", N, C, ms_unfused, bw_unfused);
+
+    // fused: single pass
+    double ms_fused = benchmark_ms([&]() {
+        add_layernorm_fused_kernel<<<rows, threads>>>(device_input, device_residual, device_gamma, device_beta, device_output, rows, C, eps);
+    });
+    double bw_fused = ideal_bytes / (ms_fused * 1e-3) / 1e9;
+    printf("add_layernorm,fused,%d,%d,%.5f,%.2f\n", N, C, ms_fused, bw_fused);
+
+    fprintf(stderr, "  rows=%6d C=%4d  unfused %.5f ms (%.1f GB/s)  fused %.5f ms (%.1f GB/s)\n",
+            rows, C, ms_unfused, bw_unfused, ms_fused, bw_fused);
+
+    CUDA_CHECK(cudaFree(device_input));
+    CUDA_CHECK(cudaFree(device_residual));
+    CUDA_CHECK(cudaFree(device_gamma));
+    CUDA_CHECK(cudaFree(device_beta));
+    CUDA_CHECK(cudaFree(device_tmp));
+    CUDA_CHECK(cudaFree(device_output));
 }
 
 // ===========================================================================
@@ -507,43 +655,99 @@ void run_add_layernorm(int rows, int C) {
 #ifdef TORCH_EXTENSION
 
 at::Tensor relu_fwd(at::Tensor x) {
-    // TODO: TORCH_CHECK(x.is_cuda()), x.contiguous(), y = at::empty_like(x),
-    //       launch relu_kernel on x.data_ptr<float>(), return y
-    return x;
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "x must be float32");
+    x = x.contiguous();
+
+    auto y = at::empty_like(x);
+    int N = x.numel();
+
+    int threads = 256;
+    int vec_work = (N + 3) / 4;
+    int blocks = std::min((vec_work + threads - 1) / threads, 1024);
+    if (blocks < 1) blocks = 1;
+
+    relu_kernel<<<blocks, threads>>>(x.data_ptr<float>(), y.data_ptr<float>(), N);
+    CUDA_CHECK(cudaGetLastError());
+
+    return y;
 }
 
 at::Tensor gelu_fwd(at::Tensor x) {
-    // TODO: same structure as relu_fwd but calling gelu_kernel
-    return x;
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "x must be float32");
+
+    // gelu_kernel runs in place, so transform a contiguous copy of x
+    auto y = x.contiguous().clone();
+    int N = y.numel();
+
+    int threads = 256;
+    int vec_work = (N + 3) / 4;
+    int blocks = std::min((vec_work + threads - 1) / threads, 1024);
+    if (blocks < 1) blocks = 1;
+
+    gelu_kernel<<<blocks, threads>>>(y.data_ptr<float>(), N);
+    CUDA_CHECK(cudaGetLastError());
+
+    return y;
 }
 
 // x (N,), bias (C,) where N is divisible by C
 at::Tensor bias_gelu_fwd(at::Tensor x, at::Tensor bias) {
-    // TODO
-    return x;
+    TORCH_CHECK(x.is_cuda() && bias.is_cuda(), "x and bias must be CUDA tensors");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "x must be float32");
+    TORCH_CHECK(bias.scalar_type() == at::kFloat, "bias must be float32");
+    x = x.contiguous();
+    bias = bias.contiguous();
+
+    auto y = at::empty_like(x);
+    int N = x.numel();
+    int C = bias.numel();
+
+    int threads = 256;
+    int vec_work = (N + 3) / 4;
+    int blocks = std::min((vec_work + threads - 1) / threads, 1024);
+    if (blocks < 1) blocks = 1;
+
+    bias_gelu_fused_kernel<<<blocks, threads>>>(x.data_ptr<float>(), bias.data_ptr<float>(), y.data_ptr<float>(), N, C);
+    CUDA_CHECK(cudaGetLastError());
+
+    return y;
 }
 
 // x (rows, C), residual (rows, C), gamma (C,), beta (C,)
-at::Tensor add_layernorm_fwd(at::Tensor x, at::Tensor residual,
-                              at::Tensor gamma, at::Tensor beta,
-                              float eps) {
-    // TODO
-    return x;
+at::Tensor add_layernorm_fwd(at::Tensor x, at::Tensor residual, at::Tensor gamma, at::Tensor beta, float eps) {
+    TORCH_CHECK(x.is_cuda() && residual.is_cuda() && gamma.is_cuda() && beta.is_cuda(), "all inputs must be CUDA tensors");
+    TORCH_CHECK(x.scalar_type() == at::kFloat, "inputs must be float32");
+    TORCH_CHECK(x.dim() == 2, "x must be 2-D (rows, C)");
+    x = x.contiguous();
+    residual = residual.contiguous();
+    gamma = gamma.contiguous();
+    beta = beta.contiguous();
+
+    auto y = at::empty_like(x);
+    int rows = x.size(0);
+    int C = x.size(1);
+
+    // one block per row: the layernorm reduction is per-row
+    int threads = 256;
+    add_layernorm_fused_kernel<<<rows, threads>>>(x.data_ptr<float>(), residual.data_ptr<float>(), gamma.data_ptr<float>(), beta.data_ptr<float>(), y.data_ptr<float>(), rows, C, eps);
+    CUDA_CHECK(cudaGetLastError());
+
+    return y;
 }
 
 // TORCH_EXTENSION_NAME is set by setup.py; in Python: import activations_cuda
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "Project B: fused activation CUDA kernels";
 
-    m.def("relu_fwd",          &relu_fwd,          "ReLU forward");
-    m.def("gelu_fwd",          &gelu_fwd,          "GELU forward (unfused)");
-
-    // TODO: uncomment once implemented
-    // m.def("bias_gelu_fwd",     &bias_gelu_fwd,     "Bias + GELU fused forward");
-    // m.def("add_layernorm_fwd", &add_layernorm_fwd, "Add + LayerNorm fused forward");
+    m.def("relu_fwd", &relu_fwd, "ReLU forward");
+    m.def("gelu_fwd", &gelu_fwd, "GELU forward (unfused)");
+    m.def("bias_gelu_fwd", &bias_gelu_fwd, "Bias + GELU fused forward");
+    m.def("add_layernorm_fwd", &add_layernorm_fwd, "Add + LayerNorm fused forward");
 }
 
-#endif // TORCH_EXTENSION
+#endif
 
 
 // ===========================================================================
