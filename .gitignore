@@ -1,6 +1,19 @@
 # Build outputs
-project-a/roofline
-project-a/*.o
+01-matmul-roofline/roofline
+02-operator-fusion/kernels
+*.o
+
+# PyTorch / setuptools extension build
+build/
+*.so
+
+# ninja bookkeeping
+.ninja_log
+.ninja_deps
+build.ninja
+
+# run logs
+*.log
 
 # CUDA intermediates
 *.ptx
