@@ -6,7 +6,7 @@ in progress. this is the capstone.
 
 an inference engine for an 8gb laptop card that runs models **bigger than its own vram**, by deciding what lives in vram, what lives in system ram, and when to move it.
 
-the engine is the vehicle. the actual deliverable is a **two tier roofline**: a model of this machine that predicts, before you run anything, which optimization is going to pay and by how much.
+the deliverable is the engine: a server that unifies vram and system ram into one space so a model too big for the card runs at all. still in progress, but the **two tier roofline** already predicts the payoff — quantized to 4-bit, llama 3 8b should run near 60 tokens/sec, while the full 16-bit version still runs but crawls to about 3 as it spills across pcie. the roofline is the tool that says which optimization pays; the engine is what delivers it.
 
 ## the wall, and why offload changes its shape
 
