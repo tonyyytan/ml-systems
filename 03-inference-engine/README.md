@@ -6,18 +6,18 @@ in progress. this is the capstone.
 
 an inference engine for an 8gb laptop card that runs models **bigger than its own vram**, by deciding what lives in vram, what lives in system ram, and when to move it.
 
-the deliverable is the engine: a server that unifies vram and system ram into one space so a model too big for the card runs at all. still in progress, but the **two tier roofline** already predicts the payoff — quantized to 4-bit, llama 3 8b should run near 60 tokens/sec, while the full 16-bit version still runs but crawls to about 3 as it spills across pcie. the roofline is the tool that says which optimization pays; the engine is what delivers it.
+the deliverable is the engine: a server that unifies vram and system ram into one space so a model too big for the card runs at all. still in progress, but the **two tier roofline** already predicts the payoff — quantized to 4-bit, llama 3 8b runs near 60 tokens/sec fully resident, while the full 16-bit version still runs but crawls to ~1.6 tok/s on this card as half its weights spill across pcie (~3 tok/s on a gen4 x16 link that offloads only ~25%; see the measured table below). the roofline is the tool that says which optimization pays; the engine is what delivers it.
 
 ## the wall, and why offload changes its shape
 
 decode is memory bound. to make one token you stream every weight in the model out of memory, do a trivial amount of arithmetic with each one, and throw it away. roughly 1-2 flops per byte, so you sit pinned to the 272 gb/s ceiling with the compute units idle. a faster kernel does nothing. the kernel is already at the ceiling.
 
-now make the model too big to fit. the spilled layers go to system ram, which is not on the fast road, it's across pcie at somewhere around 16-32 gb/s. **an offloaded layer is about ten times slower to stream than a resident one.**
+now make the model too big to fit. the spilled layers go to system ram, which is not on the fast road, it's across pcie — measured at **14 gb/s** on this laptop's gen4 x8 link (the 16-32 range assumes x16; step 0 pins the real number). **an offloaded layer is ~20x slower to stream than a resident one here (272 vs 14 gb/s).**
 
 so there is no longer one roofline, there are two:
 
 ```
-decode time  ~=  bytes in vram / 272 gb/s  +  bytes in ram / ~25 gb/s
+decode time  ~=  bytes in vram / 272 gb/s  +  bytes in ram / 14 gb/s   (measured, gen4 x8)
 ```
 
 the second term swamps the first almost immediately, and that changes what optimization means.
@@ -29,6 +29,23 @@ the second term swamps the first almost immediately, and that changes what optim
 while the model already fits, int8 halves the traffic and buys you ~2x. fine. but if quantizing is what stops the model spilling *at all*, you don't get 2x, you get 5-10x, because you deleted the pcie term from the equation. the win came from crossing a boundary, not from moving fewer bytes.
 
 8gb puts that cliff exactly where it can be studied. llama 3 8b: fp16 is ~16gb and spills badly, int8 is ~8gb and sits on the knife edge, int4 is ~4gb and fits with room for kv cache. the cliff is sweepable on hardware i already own.
+
+### measured on this machine (step 0)
+
+legion 5, rtx 5060 laptop (blackwell gb206), wsl2. the pcie slope is measured, not spec'd: pinned host-to-device tops out at **14 gb/s**, and the link negotiates **gen4 x8** (the silicon can do x16, the laptop wires x8), so 14 is ~89% of the gen4-x8 ceiling — a healthy link, just half the lanes. pinned barely beats pageable (14 vs 13), which is its own wsl2 finding: the page-locked advantage async prefetch leans on is thin here.
+
+feeding 272 / 14 gb/s into the roofline, decode throughput for llama-3-8b (fp16, seq 2048) vs how much of the footprint spills:
+
+| offload | tok/s | when it happens |
+|--------:|------:|-----------------|
+|   0%    | 16.7  | fits entirely in vram (needs a bigger card or lower precision) |
+|  10%    |  5.9  | |
+|  25%    |  3.0  | 12 gb-class card, or a gen4 x16 link |
+|  40%    |  2.0  | |
+| **51%** | **1.6** | **8 gb card, full fp16 — the forced floor: 16.3 gb footprint can't keep more than 8 gb resident** |
+| 100%    |  0.9  | pure pcie |
+
+the takeaway the table makes concrete: on the 8 gb card fp16 *has* to offload ≥51%, so ~1.6 tok/s is its floor here; the ~3 tok/s figure is the same model at ~25% spill, which needs a 12 gb card or a gen4 x16 link. int4 sidesteps all of it — 4.3 gb fits, 0% offload, ~63 tok/s.
 
 ### why batching comes back
 
