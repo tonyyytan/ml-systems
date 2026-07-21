@@ -151,19 +151,30 @@ the escape that works at batch 1. use the int4 model as its own draft, verify wi
 
 kernels in cuda, harness in python. same split as 02: `.cu` files build into one torch extension via `setup.py`.
 
+grouped by deliverable. run scripts from THIS directory as modules so the
+cross-package imports resolve, e.g. `python3 -m roofline.validate_llamacpp`.
+
 ```
-roofline2.py     the two tier model. the actual deliverable.
-gemv.cu          fp16 / int8 / fp8 fused dequant matvec
-attention.cu     attention over the tiered paged cache
-setup.py         builds the extension
-quantize.py      per-channel scales + weight packing
-placement.py     vram/ram layer placement + prefetch streams
-paged_cache.py   block allocator, location + precision per block
-scheduler.py     continuous batching
-runner.py        the floor: batch 1 + static batching
-engine.py        mine: ties placement, cache, scheduler and kernels together
-bench.py         sweep over all systems
-plot_engine.py   the charts
+setup.py               builds the cuda extension (top level: sees all kernels)
+
+roofline/              deliverable #1: the model + its validation
+  roofline2.py         the two tier model. the actual deliverable.
+  validate_llamacpp.py step 2 gate: overlay -ngl measurements on the prediction
+
+engine/                deliverable #2: the engine (the part that's mine)
+  runner.py            the floor: batch 1 + static batching
+  quantize.py          per-channel scales + weight packing
+  placement.py         vram/ram layer placement + prefetch streams
+  paged_cache.py       block allocator, location + precision per block
+  scheduler.py         continuous batching
+  engine.py            mine: ties placement, cache, scheduler and kernels together
+  kernels/
+    gemv.cu            fp16 / int8 / fp8 fused dequant matvec
+    attention.cu       attention over the tiered paged cache
+
+bench/                 ties it together
+  bench.py             sweep over all systems
+  plot_engine.py       the charts
 ```
 
 ## notes
