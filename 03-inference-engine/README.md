@@ -1,23 +1,23 @@
 # 03 inference engine
 
-in progress. this is the capstone.
+in progress. this is the capstone. the two-tier roofline (steps 1-2) is done and validated against llama.cpp; the engine is next.
 
 ## what it is
 
 an inference engine for an 8gb laptop card that runs models **bigger than its own vram**, by deciding what lives in vram, what lives in system ram, and when to move it.
 
-the deliverable is the engine: a server that unifies vram and system ram into one space so a model too big for the card runs at all. still in progress, but the **two tier roofline** already predicts the payoff — quantized to 4-bit, llama 3 8b should run near 60 tokens/sec, while the full 16-bit version still runs but crawls to about 3 as it spills across pcie. the roofline is the tool that says which optimization pays; the engine is what delivers it.
+the deliverable is the engine: a server that unifies vram and system ram into one space so a model too big for the card runs at all. still in progress, but the **two tier roofline** already predicts the payoff — quantized to 4-bit, llama 3 8b runs near 60 tokens/sec fully resident, while the full 16-bit version still runs but crawls to ~1.6 tok/s on this card as half its weights spill across pcie (~3 tok/s on a gen4 x16 link that offloads only ~25%; see the measured table below). the roofline is the tool that says which optimization pays; the engine is what delivers it.
 
 ## the wall, and why offload changes its shape
 
 decode is memory bound. to make one token you stream every weight in the model out of memory, do a trivial amount of arithmetic with each one, and throw it away. roughly 1-2 flops per byte, so you sit pinned to the 272 gb/s ceiling with the compute units idle. a faster kernel does nothing. the kernel is already at the ceiling.
 
-now make the model too big to fit. the spilled layers go to system ram, which is not on the fast road, it's across pcie at somewhere around 16-32 gb/s. **an offloaded layer is about ten times slower to stream than a resident one.**
+now make the model too big to fit. the spilled layers go to system ram, which is not on the fast road, it's across pcie — measured at **14 gb/s** on this laptop's gen4 x8 link (the 16-32 range assumes x16; step 0 pins the real number). **an offloaded layer is ~20x slower to stream than a resident one here (272 vs 14 gb/s).**
 
 so there is no longer one roofline, there are two:
 
 ```
-decode time  ~=  bytes in vram / 272 gb/s  +  bytes in ram / ~25 gb/s
+decode time  ~=  bytes in vram / 272 gb/s  +  bytes in ram / 14 gb/s   (measured, gen4 x8)
 ```
 
 the second term swamps the first almost immediately, and that changes what optimization means.
@@ -29,6 +29,60 @@ the second term swamps the first almost immediately, and that changes what optim
 while the model already fits, int8 halves the traffic and buys you ~2x. fine. but if quantizing is what stops the model spilling *at all*, you don't get 2x, you get 5-10x, because you deleted the pcie term from the equation. the win came from crossing a boundary, not from moving fewer bytes.
 
 8gb puts that cliff exactly where it can be studied. llama 3 8b: fp16 is ~16gb and spills badly, int8 is ~8gb and sits on the knife edge, int4 is ~4gb and fits with room for kv cache. the cliff is sweepable on hardware i already own.
+
+### measured on this machine (step 0)
+
+legion 5, rtx 5060 laptop (blackwell gb206), wsl2. the pcie slope is measured, not spec'd: pinned host-to-device tops out at **14 gb/s**, and the link negotiates **gen4 x8** (the silicon can do x16, the laptop wires x8), so 14 is ~89% of the gen4-x8 ceiling — a healthy link, just half the lanes. pinned barely beats pageable (14 vs 13), which is its own wsl2 finding: the page-locked advantage async prefetch leans on is thin here.
+
+feeding 272 / 14 gb/s into the roofline, decode throughput for llama-3-8b (fp16, seq 2048) vs how much of the footprint spills:
+
+| offload | tok/s | when it happens |
+|--------:|------:|-----------------|
+|   0%    | 16.7  | fits entirely in vram (needs a bigger card or lower precision) |
+|  10%    |  5.9  | |
+|  25%    |  3.0  | 12 gb-class card, or a gen4 x16 link |
+|  40%    |  2.0  | |
+| **51%** | **1.6** | **8 gb card, full fp16 — the forced floor: 16.3 gb footprint can't keep more than 8 gb resident** |
+| 100%    |  0.9  | pure pcie |
+
+the takeaway the table makes concrete: on the 8 gb card fp16 *has* to offload ≥51%, so ~1.6 tok/s is its floor here; the ~3 tok/s figure is the same model at ~25% spill, which needs a 12 gb card or a gen4 x16 link. int4 sidesteps all of it — 4.3 gb fits, 0% offload, ~63 tok/s.
+
+### step 2: does the curve land? (validated)
+
+swept `-ngl` 0→32 on llama-3.1-8b, int4 (q4_k_m, 4.9 gb) and int8 (q8_0, 8.5 gb), seq 2048, batch 1, decode timed with `llama-bench -d 2048` so the kv cache is full. each predicted line is drawn at the gguf's real on-disk bits/param (q4_k_m is 4.9, not 4.0). the measured points land on the roofline within **±6%** across the whole offload sweep. the model holds.
+
+![two-tier roofline validation](roofline/validate-llamacpp.png)
+
+but they land on a slope of **48 gb/s, not 14** — and that's the finding. llama.cpp's `-ngl` doesn't stream offloaded weights over pcie. it runs those layers *on the cpu*, out of system ram (ddr5, ~48 gb/s measured off the ngl=0 endpoint); only the activations cross pcie. so there isn't one offload tier, there are two:
+
+- **cpu-offload** (~48 gb/s) — offloaded layer computed on the cpu. what llama.cpp does, and what the solid lines predict.
+- **pcie-stream** (14 gb/s) — offloaded weights shipped to the gpu to compute there. what *this* engine does. the dashed lines, the floor naive streaming would sit on.
+
+the 14 gb/s in "the wall" above is still the right number for the engine's streaming path — it just isn't the number llama.cpp pays. both are real, they're different mechanisms.
+
+and the gap is why this matters instead of being a footnote: **at batch 1 cpu-offload (48) beats naive pcie-streaming (14) by 3.5x.** streaming to the gpu is a *losing* move at batch 1 — the engine only gets ahead once batching hides the pcie copy behind compute and the fast gpu takes over. the baseline being stronger than the naive floor is exactly what forces the next section.
+
+(int8 has no 0%-offload point: at 8.5 gb it can't sit fully resident on 8 gb, so `-ngl 32` oversubscribes vram and the driver falls back to shared memory — dropped as an artifact. that unreachable corner is the cliff, live.)
+
+**reproduce.** the plot regenerates from the committed `roofline/sweep_results.json` with matplotlib alone:
+
+```
+python3 -m roofline.validate_llamacpp
+```
+
+to re-run the sweep itself (`--resweep`) needs llama.cpp built with cuda and the two ggufs (paths are set at the top of `validate_llamacpp.py`):
+
+```
+# llama.cpp, cuda, blackwell sm_120
+git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120
+cmake --build build --target llama-bench
+
+# models (pip install huggingface_hub)
+hf download bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \
+  Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf Meta-Llama-3.1-8B-Instruct-Q8_0.gguf \
+  --local-dir ~/models
+```
 
 ### why batching comes back
 
@@ -106,8 +160,8 @@ not that any one piece is too hard. it's spending two months on a paged attentio
 **1. two tier roofline** - `roofline2.py`
 extend the 01 plot with the pcie slope. predict decode throughput as a function of model size, precision, and fraction of layers offloaded. **this is the artifact. everything below exists to test it.**
 
-**2. validate against llama.cpp** - cheap and high signal
-sweep `-ngl` from 0 to all layers on a model that doesn't fit. measure tokens/sec at each point. overlay the prediction from step 1. if the curve lands, the model is real and the rest of the project has a foundation. if it doesn't, stop and find out why.
+**2. validate against llama.cpp** - cheap and high signal — **done, see [step 2 above](#step-2-does-the-curve-land-validated)**
+sweep `-ngl` from 0 to all layers on a model that doesn't fit. measure tokens/sec at each point. overlay the prediction from step 1. the curve lands (±6%), and it turned up the cpu-offload-vs-pcie distinction — the "if it doesn't, stop and find out why" case, which is where the second offload tier came from.
 
 **3. model runner** - `runner.py`
 load a model, kv cached greedy generate. the floor. two modes: batch 1, and static batching (pad to longest, wait for the slowest, contiguous max-length kv per sequence). the static mode matters: without it the final chart can only prove "batching helps", which nobody doubts, instead of "my batching is good", which is the actual claim.
@@ -134,19 +188,30 @@ the escape that works at batch 1. use the int4 model as its own draft, verify wi
 
 kernels in cuda, harness in python. same split as 02: `.cu` files build into one torch extension via `setup.py`.
 
+grouped by deliverable. run scripts from THIS directory as modules so the
+cross-package imports resolve, e.g. `python3 -m roofline.validate_llamacpp`.
+
 ```
-roofline2.py     the two tier model. the actual deliverable.
-gemv.cu          fp16 / int8 / fp8 fused dequant matvec
-attention.cu     attention over the tiered paged cache
-setup.py         builds the extension
-quantize.py      per-channel scales + weight packing
-placement.py     vram/ram layer placement + prefetch streams
-paged_cache.py   block allocator, location + precision per block
-scheduler.py     continuous batching
-runner.py        the floor: batch 1 + static batching
-engine.py        mine: ties placement, cache, scheduler and kernels together
-bench.py         sweep over all systems
-plot_engine.py   the charts
+setup.py               builds the cuda extension (top level: sees all kernels)
+
+roofline/              deliverable #1: the model + its validation
+  roofline2.py         the two tier model. the actual deliverable.
+  validate_llamacpp.py step 2 gate: overlay -ngl measurements on the prediction
+
+engine/                deliverable #2: the engine (the part that's mine)
+  runner.py            the floor: batch 1 + static batching
+  quantize.py          per-channel scales + weight packing
+  placement.py         vram/ram layer placement + prefetch streams
+  paged_cache.py       block allocator, location + precision per block
+  scheduler.py         continuous batching
+  engine.py            mine: ties placement, cache, scheduler and kernels together
+  kernels/
+    gemv.cu            fp16 / int8 / fp8 fused dequant matvec
+    attention.cu       attention over the tiered paged cache
+
+bench/                 ties it together
+  bench.py             sweep over all systems
+  plot_engine.py       the charts
 ```
 
 ## notes
