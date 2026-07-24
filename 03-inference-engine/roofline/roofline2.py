@@ -3,7 +3,7 @@ Project 03, Step 1: the two-tier roofline. THE deliverable.
 
 01 asked "compute or bandwidth bound?" for a resident workload. This asks the
 same question once the model no longer fits: some layers live in VRAM (streamed
-at ~272 GB/s) and the rest spill to system RAM (streamed across PCIe at ~25
+at ~272 GB/s) and the rest spill to system RAM (streamed across PCIe at ~14
 GB/s). Decode has to read every weight to make one token, so per-token time is
 the sum of two bandwidth terms, not one:
 
@@ -18,17 +18,20 @@ measured in Step 0.
 """
 
 from dataclasses import dataclass
+from pathlib import Path
 import matplotlib.pyplot as plt
 
+OUT_DIR = Path(__file__).parent
+
 # --- hardware constants -----------------------------------------------------
-# VRAM_BW is the resident slope (reuse the 01 measurement). PCIE_BW is the
-# offload slope and is the second slope of the entire project: it MUST come from
-# the Step 0 cudaMemcpy microbenchmark (pinned H2D), not a spec sheet, and on
-# WSL2 the pinned-vs-pageable gap decides whether prefetch is even viable.
-# Filled from Step 0 on the Legion 5 / RTX 5060 (Blackwell GB206), WSL2.
+# Measured on the Legion 5 / RTX 5060 (Blackwell GB206), WSL2. PCIE_BW is the
+# offload slope from the Step 0 pinned-H2D microbenchmark, not a spec sheet.
 VRAM_BW_GB_S = 272    # resident slope, GB206 peak (reused from 01/02)
 PCIE_BW_GB_S = 14     # offload slope, MEASURED pinned H2D on WSL2 (pageable ~13,
                       # so the pinned gap is thin here). below the ~16-32 hoped for.
+CPU_BW_GB_S = 48      # second offload tier. llama.cpp -ngl computes offloaded layers
+                      # on the CPU from system RAM (DDR5), not over PCIe. measured from
+                      # the ngl=0 endpoint. see validate_llamacpp.py.
 VRAM_CAPACITY_GB = 8  # 5060 laptop has 8 GB (8151 MiB). sets where the cliff sits.
 
 # The KV cache stays fp16 even when the weights are quantized to int8/int4, so
@@ -78,12 +81,15 @@ def footprint_bytes(model: ModelConfig, bits: int, seq_len: int, batch: int) -> 
     return weight_bytes(model, bits) + kv_bytes_per_token(model, seq_len, batch)
 
 
-def decode_time_per_token(model: ModelConfig, bits: int, offload_frac: float, seq_len: int, batch: int) -> float:
+def decode_time_per_token(model: ModelConfig, bits: int, offload_frac: float, seq_len: int, batch: int,
+                          offload_bw_gb_s: float = PCIE_BW_GB_S) -> float:
     """
-    The two-tier equation. offload_frac in [0,1] is the fraction of layers that
-    spill to RAM; those bytes pay the PCIE slope, the rest pay the VRAM slope.
+    The two-tier equation. offload_frac in [0,1] is the fraction of layers out of
+    VRAM; those bytes pay offload_bw, the rest pay VRAM_BW.
 
-        t = resident_bytes / VRAM_BW  +  offloaded_bytes / PCIE_BW
+        t = resident_bytes / VRAM_BW  +  offloaded_bytes / offload_bw
+
+    offload_bw is PCIE_BW (this engine's streaming path) or CPU_BW (llama.cpp -ngl).
     """
     total_weights = weight_bytes(model, bits)
     total_kv = kv_bytes_per_token(model, seq_len, batch)
@@ -91,13 +97,14 @@ def decode_time_per_token(model: ModelConfig, bits: int, offload_frac: float, se
     ram_bytes = (total_weights * offload_frac) + (total_kv * offload_frac)
     vram_bytes = (total_weights * (1 - offload_frac)) + (total_kv * (1 - offload_frac))
 
-    time = vram_bytes / (VRAM_BW_GB_S * 1e9) + ram_bytes / (PCIE_BW_GB_S * 1e9)
+    time = vram_bytes / (VRAM_BW_GB_S * 1e9) + ram_bytes / (offload_bw_gb_s * 1e9)
     return time
 
-def predict_throughput(model: ModelConfig, bits: int, offload_frac: float, seq_len: int, batch: int) -> float:
+def predict_throughput(model: ModelConfig, bits: int, offload_frac: float, seq_len: int, batch: int,
+                       offload_bw_gb_s: float = PCIE_BW_GB_S) -> float:
     """Predicted decode throughput in tokens/sec = batch / t_token."""
-    # batch / (s / token * batch) = token / s 
-    return batch / decode_time_per_token(model, bits, offload_frac, seq_len, batch)
+    # batch / (s / token * batch) = token / s
+    return batch / decode_time_per_token(model, bits, offload_frac, seq_len, batch, offload_bw_gb_s)
 
 
 def offload_fraction(model: ModelConfig, bits: int, vram_gb: float, seq_len: int, batch: int) -> float:
@@ -144,17 +151,17 @@ def sweep_precision(model: ModelConfig, bits_list: list[int], vram_gb: float, se
     return results
 
 
-def sweep_offload_fraction(model: ModelConfig, bits: int, fracs_list: list[float], seq_len: int, batch: int) -> dict:
+def sweep_offload_fraction(model: ModelConfig, bits: int, fracs_list: list[float], seq_len: int, batch: int,
+                           offload_bw_gb_s: float = PCIE_BW_GB_S) -> dict:
     """
-    The continuous version: force offload_frac from 0 to 1 and predict
-    tokens/sec at each point. THIS is the curve Step 2 overlays llama.cpp
-    -ngl measurements onto. Returns 'offload_frac', 'tokens_per_sec'.
+    Force offload_frac from 0 to 1 and predict tokens/sec at each point. The curve
+    Step 2 overlays llama.cpp -ngl measurements onto. Returns 'offload_frac', 'tps'.
     """
-    
+
     results = {"offload_frac": [], "tps": []}
 
     for frac in fracs_list:
-        tps = predict_throughput(model, bits, frac, seq_len, batch)
+        tps = predict_throughput(model, bits, frac, seq_len, batch, offload_bw_gb_s)
         results["offload_frac"].append(frac)
         results["tps"].append(tps)
 
@@ -224,5 +231,5 @@ if __name__ == "__main__":
                                   seq_len, batch)
 
     plot_two_tier(prec, off)
-    plt.savefig("two-tier-roofline.png", dpi=150)
-    print("Saved two-tier-roofline.png")
+    plt.savefig(OUT_DIR / "two-tier-roofline.png", dpi=150)
+    print(f"Saved {OUT_DIR / 'two-tier-roofline.png'}")

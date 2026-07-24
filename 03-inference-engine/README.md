@@ -1,6 +1,6 @@
 # 03 inference engine
 
-in progress. this is the capstone.
+in progress. this is the capstone. the two-tier roofline (steps 1-2) is done and validated against llama.cpp; the engine is next.
 
 ## what it is
 
@@ -46,6 +46,43 @@ feeding 272 / 14 gb/s into the roofline, decode throughput for llama-3-8b (fp16,
 | 100%    |  0.9  | pure pcie |
 
 the takeaway the table makes concrete: on the 8 gb card fp16 *has* to offload ≥51%, so ~1.6 tok/s is its floor here; the ~3 tok/s figure is the same model at ~25% spill, which needs a 12 gb card or a gen4 x16 link. int4 sidesteps all of it — 4.3 gb fits, 0% offload, ~63 tok/s.
+
+### step 2: does the curve land? (validated)
+
+swept `-ngl` 0→32 on llama-3.1-8b, int4 (q4_k_m, 4.9 gb) and int8 (q8_0, 8.5 gb), seq 2048, batch 1, decode timed with `llama-bench -d 2048` so the kv cache is full. each predicted line is drawn at the gguf's real on-disk bits/param (q4_k_m is 4.9, not 4.0). the measured points land on the roofline within **±6%** across the whole offload sweep. the model holds.
+
+![two-tier roofline validation](roofline/validate-llamacpp.png)
+
+but they land on a slope of **48 gb/s, not 14** — and that's the finding. llama.cpp's `-ngl` doesn't stream offloaded weights over pcie. it runs those layers *on the cpu*, out of system ram (ddr5, ~48 gb/s measured off the ngl=0 endpoint); only the activations cross pcie. so there isn't one offload tier, there are two:
+
+- **cpu-offload** (~48 gb/s) — offloaded layer computed on the cpu. what llama.cpp does, and what the solid lines predict.
+- **pcie-stream** (14 gb/s) — offloaded weights shipped to the gpu to compute there. what *this* engine does. the dashed lines, the floor naive streaming would sit on.
+
+the 14 gb/s in "the wall" above is still the right number for the engine's streaming path — it just isn't the number llama.cpp pays. both are real, they're different mechanisms.
+
+and the gap is why this matters instead of being a footnote: **at batch 1 cpu-offload (48) beats naive pcie-streaming (14) by 3.5x.** streaming to the gpu is a *losing* move at batch 1 — the engine only gets ahead once batching hides the pcie copy behind compute and the fast gpu takes over. the baseline being stronger than the naive floor is exactly what forces the next section.
+
+(int8 has no 0%-offload point: at 8.5 gb it can't sit fully resident on 8 gb, so `-ngl 32` oversubscribes vram and the driver falls back to shared memory — dropped as an artifact. that unreachable corner is the cliff, live.)
+
+**reproduce.** the plot regenerates from the committed `roofline/sweep_results.json` with matplotlib alone:
+
+```
+python3 -m roofline.validate_llamacpp
+```
+
+to re-run the sweep itself (`--resweep`) needs llama.cpp built with cuda and the two ggufs (paths are set at the top of `validate_llamacpp.py`):
+
+```
+# llama.cpp, cuda, blackwell sm_120
+git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120
+cmake --build build --target llama-bench
+
+# models (pip install huggingface_hub)
+hf download bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \
+  Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf Meta-Llama-3.1-8B-Instruct-Q8_0.gguf \
+  --local-dir ~/models
+```
 
 ### why batching comes back
 
@@ -123,8 +160,8 @@ not that any one piece is too hard. it's spending two months on a paged attentio
 **1. two tier roofline** - `roofline2.py`
 extend the 01 plot with the pcie slope. predict decode throughput as a function of model size, precision, and fraction of layers offloaded. **this is the artifact. everything below exists to test it.**
 
-**2. validate against llama.cpp** - cheap and high signal
-sweep `-ngl` from 0 to all layers on a model that doesn't fit. measure tokens/sec at each point. overlay the prediction from step 1. if the curve lands, the model is real and the rest of the project has a foundation. if it doesn't, stop and find out why.
+**2. validate against llama.cpp** - cheap and high signal — **done, see [step 2 above](#step-2-does-the-curve-land-validated)**
+sweep `-ngl` from 0 to all layers on a model that doesn't fit. measure tokens/sec at each point. overlay the prediction from step 1. the curve lands (±6%), and it turned up the cpu-offload-vs-pcie distinction — the "if it doesn't, stop and find out why" case, which is where the second offload tier came from.
 
 **3. model runner** - `runner.py`
 load a model, kv cached greedy generate. the floor. two modes: batch 1, and static batching (pad to longest, wait for the slowest, contiguous max-length kv per sequence). the static mode matters: without it the final chart can only prove "batching helps", which nobody doubts, instead of "my batching is good", which is the actual claim.
