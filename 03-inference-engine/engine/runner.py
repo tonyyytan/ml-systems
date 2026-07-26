@@ -56,12 +56,6 @@ class Runner:
     def __init__(self, model_id: str = MODEL_ID):
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
         self.model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=DTYPE).to(DEVICE).eval()
-        # TODO: load tokenizer + model onto DEVICE at DTYPE.
-        #   self.tokenizer = AutoTokenizer.from_pretrained(model_id)
-        #   self.model = AutoModelForCausalLM.from_pretrained(
-        #       model_id, torch_dtype=DTYPE).to(DEVICE).eval()
-        # eval() disables dropout etc.; we are only ever doing inference.
-        raise NotImplementedError
 
     @torch.no_grad()
     def generate(self, prompts: list[str], max_tokens: int) -> list[str]:
