@@ -86,11 +86,31 @@ class Runner:
         N would re-process all N-1 previous tokens. With it, each step reads the
         cache (the kv_bytes term in the roofline) and computes only the new token.
         """
-        # TODO: implement. HF exposes this via model(..., past_key_values=cache,
-        #       use_cache=True); returned past_key_values is the KV cache to pass
-        #       back next step. Keep it explicit here so the mechanism is visible
-        #       -- do NOT just call model.generate(), we want to own the loop.
-        raise NotImplementedError
+        #tokenize
+        inputs = self.tokenizer(prompt, return_tensors = "pt")
+        input_ids = inputs["input_ids"].to(DEVICE)
+        generated_ids = []
+        
+        #prefill
+        outputs = self.model(input_ids = input_ids, use_cache = True)
+        past_key_values = outputs.past_key_values
+        next_token_logits = outputs.logits[:, -1, :]
+
+        #decode
+        for _ in range(max_tokens):
+            next_token_id = torch.argmax(next_token_logits, dim = -1, keepdim=True)
+
+            if next_token_id.item() == self.tokenizer.eos_token_id:
+                break
+            generated_ids.append(next_token_id.item())
+
+            outputs = self.model(input_ids=next_token_id, past_key_values= past_key_values, use_cache=True)
+            past_key_values = outputs.past_key_values
+            next_token_logits = outputs.logits[:, -1, :]
+
+        #detokenize original + generated ones from decode
+        full_ids = torch.cat([input_ids, torch.tensor([generated_ids], device=DEVICE)], dim=-1)
+        return self.tokenizer.decode(full_ids[0], skip_special_tokens=True)
 
     def _generate_static_batch(self, prompts: list[str], max_tokens: int) -> list[str]:
         """
