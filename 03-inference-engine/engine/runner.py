@@ -33,7 +33,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # TODO: fill on the machine. Use the SAME model family the roofline is built
 #       around (llama-3-8b) so the numbers are comparable. Precision here is
 #       whatever HF loads (fp16); quantization is Step 4, not this file.
-MODEL_ID = None       # e.g. "meta-llama/Meta-Llama-3-8B"
+MODEL_ID = None       # undecided -- runner works with any HF causal LM; pick the
+                      # real target (e.g. "meta-llama/Meta-Llama-3-8B") when we bench.
 DEVICE = "cuda"
 DTYPE = torch.float16
 
@@ -59,7 +60,7 @@ class Runner:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=DTYPE).to(DEVICE).eval()
+        self.model = AutoModelForCausalLM.from_pretrained(model_id, dtype=DTYPE).to(DEVICE).eval()
 
     @torch.no_grad()
     def generate(self, prompts: list[str], max_tokens: int) -> list[str]:
@@ -196,9 +197,10 @@ if __name__ == "__main__":
     assert MODEL_ID is not None, "set MODEL_ID before running"
 
     runner = Runner()
-    # smoke test: one prompt, a handful of tokens, just prove it emits text.
+    # smoke test: batch-1 vs a 2-prompt batch of the SAME prompt. greedy is
+    # deterministic, so the batched slots must equal batch-1 exactly -- a cheap
+    # check that padding/positions in the static-batch path are correct.
     one = runner.generate(["The capital of France is"], max_tokens=32)
     two = runner.generate(["The capital of France is", "The capital of France is"], max_tokens=32)
-    print(out[0])
-
-    assert one[0] == two[1]
+    print(one[0])
+    assert one[0] == two[0] == two[1], "batched output must match batch-1"
