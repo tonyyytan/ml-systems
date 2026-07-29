@@ -55,6 +55,10 @@ class Runner:
 
     def __init__(self, model_id: str = MODEL_ID):
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
         self.model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=DTYPE).to(DEVICE).eval()
 
     @torch.no_grad()
@@ -123,16 +127,78 @@ class Runner:
         retire per step) has to BEAT. Left-pad so every sequence's real last token
         sits at the same position, which keeps the decode step aligned.
         """
-        # TODO: tokenize with padding=True, padding_side="left"; run prefill on
-        #       the padded batch; decode in lockstep tracking a per-sequence
-        #       "finished" mask so EOS'd sequences stop appending.
-        raise NotImplementedError
 
+        # tokenize all prompts
+        self.tokenizer.padding_side = "left"
+
+        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True)
+        input_ids = inputs["input_ids"].to(DEVICE) # (B, T)
+
+        attention_mask = inputs["attention_mask"].to(DEVICE)
+        prefill_mask = attention_mask
+
+        B = input_ids.shape[0]
+        eos_token_id = self.tokenizer.eos_token_id
+
+        # diff position id after padding
+        position_ids = attention_mask.long().cumsum(-1) - 1
+        position_ids.masked_fill_(attention_mask == 0, 0)
+
+        # prefill
+        outputs = self.model(input_ids = input_ids, attention_mask = attention_mask, position_ids = position_ids, use_cache = True)
+        # (B, T, V)
+        past_key_values = outputs.past_key_values
+        next_token_logits = outputs.logits[:, -1, :]
+
+        generated_ids = [[] for _ in range(B)]
+
+        #(B, true/false)
+        finished = torch.zeros(B, dtype=torch.bool, device=DEVICE)
+        
+        #decode
+        for _ in range(max_tokens):
+            next_token_ids = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+
+            for i in range(B):
+
+                if finished[i]:
+                    continue
+
+                if next_token_ids[i].item() == self.tokenizer.eos_token_id:
+                    finished[i] = True
+                else:
+                    generated_ids[i].append(next_token_ids[i].item())
+
+            if finished.all():
+                break
+            
+            ones = torch.ones((B, 1), dtype=attention_mask.dtype, device=DEVICE)
+            attention_mask = torch.cat([attention_mask, ones], dim=-1)
+            #(B, 1)
+            next_position_ids = attention_mask.sum(-1, keepdim=True) - 1
+
+            outputs = self.model(input_ids = next_token_ids, attention_mask = attention_mask, position_ids = next_position_ids, past_key_values = past_key_values, use_cache = True)
+            past_key_values = outputs.past_key_values
+            next_token_logits = outputs.logits[:, -1, :]
+        results = []
+        
+        for i in range(B):
+            real_ids = input_ids[i][prefill_mask[i] == 1]
+            new_ids = torch.tensor(generated_ids[i], dtype=real_ids.dtype, device=DEVICE)
+
+            full_ids = torch.cat([real_ids, new_ids], dim=-1)
+
+            results.append(self.tokenizer.decode(full_ids, skip_special_tokens=True))
+
+        return results
 
 if __name__ == "__main__":
     assert MODEL_ID is not None, "set MODEL_ID before running"
 
     runner = Runner()
     # smoke test: one prompt, a handful of tokens, just prove it emits text.
-    out = runner.generate(["The capital of France is"], max_tokens=32)
+    one = runner.generate(["The capital of France is"], max_tokens=32)
+    two = runner.generate(["The capital of France is", "The capital of France is"], max_tokens=32)
     print(out[0])
+
+    assert one[0] == two[1]
