@@ -78,22 +78,22 @@ __global__ void gemv_fp16_kernel(const half* __restrict__ W, const half* __restr
     int lane_id = tid % 32;
     int warps_per_block = blockDim.x / 32;
 
-    __shared__ half shared_x[K];
-
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    // int col = 1 (uninitialized)
+    extern __shared__ half shared_x[];
 
     for (int j{tid}; j < K; j += blockDim.x) {
         shared_x[j] = x[j];
     }
     __syncthreads();
 
+    int row = blockIdx.x * warps_per_block + warp_id;
+    // int col = 1 (uninitialized)
+
     if (row < M) {
 
         float thread_sum{};
 
-        for (j{lane_id}; j < K; j += 32) {
-            thread_sum += __half2float(W[row * K + j] * shared_x[j]);
+        for (int j{lane_id}; j < K; j += 32) {
+            thread_sum += __half2float(W[row * K + j]) * __half2float(shared_x[j]);
         }
 
         //warp reduction
