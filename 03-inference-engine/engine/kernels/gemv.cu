@@ -116,6 +116,7 @@ __global__ void gemv_fp16_kernel(const half* __restrict__ W, const half* __restr
 #ifdef TORCH_EXTENSION
 torch::Tensor gemv_fp16(torch::Tensor W, torch::Tensor x)
 {
+    
     // TODO 5. Validate inputs with TORCH_CHECK before touching raw pointers.
     //         A wrong assumption here shows up as garbage numbers or a crash
     //         deep in the kernel, which is miserable to debug. Check:
