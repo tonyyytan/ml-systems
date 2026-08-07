@@ -29,9 +29,14 @@
  * Build:  cd 03-inference-engine && python3 setup.py build_ext --inplace
  */
 
-// torch/extension.h must come first when building as an extension
+// torch/extension.h must come first when building as an extension.
+// These three are torch-only on purpose: they stay inside the ifdef so the
+// standalone `make` build (which does NOT define TORCH_EXTENSION) never needs
+// libtorch headers.
 #ifdef TORCH_EXTENSION
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>   // at::cuda::getCurrentCUDAStream()
+#include <c10/cuda/CUDAException.h>  // C10_CUDA_CHECK()
 #endif
 
 #include <cuda_runtime.h>
@@ -116,29 +121,41 @@ __global__ void gemv_fp16_kernel(const half* __restrict__ W, const half* __restr
 #ifdef TORCH_EXTENSION
 torch::Tensor gemv_fp16(torch::Tensor W, torch::Tensor x)
 {
-    
-    // TODO 5. Validate inputs with TORCH_CHECK before touching raw pointers.
-    //         A wrong assumption here shows up as garbage numbers or a crash
-    //         deep in the kernel, which is miserable to debug. Check:
-    //           - both are CUDA tensors
-    //           - both are kHalf
-    //           - W is 2-D, x is 1-D
-    //           - W.size(1) == x.size(0)
-    //           - W.is_contiguous() -- the kernel assumes row-major packing
+    TORCH_CHECK(W.is_cuda() && x.is_cuda(), "W and x must be CUDA tensors");
 
-    // TODO 6. Allocate the output:
-    //         torch::empty({M}, W.options())   inherits dtype + device from W.
+    TORCH_CHECK(W.dim() == 2, "W must be 2-d (matrix), got ", W.dim());
+    TORCH_CHECK(x.dim() == 1, "x must be a 1-d vector, got ", x.dim());
 
-    // TODO 7. Pick the launch config and call the kernel.
-    //         blocks = M, threads = 256.
-    //         Cast data pointers with W.data_ptr<at::Half>() then
-    //         reinterpret_cast<const half*>(...) -- at::Half and half are the
-    //         same 2 bytes but distinct C++ types.
+    TORCH_CHECK(W.size(1) == x.size(0), "shape mismatch: W is (", W.size(0), ",", W.size(1), ") but x is (", x.size(0), ")");
+    TORCH_CHECK(W.is_contiguous(), "W must be contiguous, kernel is row-major format");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
 
-    // TODO 8. Check for launch errors: cudaGetLastError(). A bad launch config
-    //         fails silently otherwise and you get zeros back.
+    //row
+    const int M = W.size(0);
+    //col
+    const int K = W.size(1);
 
-    return torch::Tensor();  // replace
+    constexpr int THREADS = 256;
+    static_assert(THREADS % 32 == 0, "warp per row mapping needs to be multiple of 32");
+
+    constexpr int WARPS_PER_BLOCK = THREADS / 32;
+
+    const size_t shmem = static_cast<size_t>(K) * sizeof(half);
+
+    TORCH_CHECK(shmem <= 48 * 1024, "K=", K, " needs ", shmem, " B of shared memory, over the 48 KB default cap");
+
+    //output
+    auto y = torch::empty({M}, W.options());
+    const int blocks = (M + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+
+    gemv_fp16_kernel<<<blocks, THREADS, shmem, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const half*>(W.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(y.data_ptr<at::Half>()),   // NOT const: this is the output
+        M, K);
+
+    C10_CUDA_CHECK(cudaGetLastError());
+    return y;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
