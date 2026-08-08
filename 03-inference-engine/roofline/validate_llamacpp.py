@@ -23,7 +23,8 @@ from pathlib import Path
 OUT_DIR = Path(__file__).parent
 
 from roofline.roofline2 import (LLAMA3_8B, sweep_offload_fraction,
-                                CPU_BW_GB_S, PCIE_BW_GB_S)
+                                CPU_BW_GB_S, PCIE_BW_GB_S,
+                                TIER_CPU, TIER_STREAM)
 
 # --- run config -------------------------------------------------------------
 LLAMA_BENCH = "/home/tanto/llama.cpp/build/bin/llama-bench"
@@ -95,9 +96,9 @@ def plot_validation(runs: list[dict]) -> None:
 
     for r in runs:
         cpu_line = sweep_offload_fraction(LLAMA3_8B, r["bits"], fracs, SEQ_LEN, BATCH,
-                                          offload_bw_gb_s=CPU_BW_GB_S)
+                                          offload_tier=TIER_CPU)
         pcie_line = sweep_offload_fraction(LLAMA3_8B, r["bits"], fracs, SEQ_LEN, BATCH,
-                                           offload_bw_gb_s=PCIE_BW_GB_S)
+                                           offload_tier=TIER_STREAM)
         ax.plot(cpu_line["offload_frac"], cpu_line["tps"],
                 color=r["color"], linewidth=2, alpha=0.7, zorder=2,
                 label=f"{r['label']} predicted — CPU-offload {CPU_BW_GB_S} GB/s")
