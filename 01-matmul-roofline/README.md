@@ -13,7 +13,9 @@ peak i measured on this card:
 - fp32: ~12.8 tflops
 - fp16: ~68 tflops (tensor cores)
 
-plot is in `roofline.png`. small matrices sit down on the memory bound slope, they never get near peak because arithmetic intensity is too low. big matrices flatten out under the compute ceiling.
+![roofline](roofline.png)
+
+small matrices sit down on the memory bound slope, they never get near peak because arithmetic intensity is too low. big matrices flatten out under the compute ceiling.
 
 ## run
 

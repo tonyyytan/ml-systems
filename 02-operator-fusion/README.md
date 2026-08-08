@@ -18,7 +18,15 @@ two ways to run them:
 
 ## status
 
-done. both paths run end to end, charts are in `fusion_benchmark.png` (standalone) and `bench_benchmark.png` (vs torch).
+done. both paths run end to end.
+
+standalone, fused vs unfused:
+
+![fusion](fusion_benchmark.png)
+
+vs pytorch eager and torch.compile:
+
+![bench](bench_benchmark.png)
 
 loose ends, none of them blocking:
 
