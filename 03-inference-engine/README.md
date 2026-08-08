@@ -1,6 +1,6 @@
 # 03 inference engine
 
-in progress. this is the capstone. the two-tier roofline (steps 1-2) is done and validated against llama.cpp; the engine is next.
+in progress. this is the capstone. the tier roofline (steps 1-2b) is done and validated against llama.cpp — including the batch axis, where it predicts the tier crossover at **b\* = 14** against llama.cpp's hard-coded 32. the engine is next.
 
 ## what it is
 
@@ -47,9 +47,17 @@ feeding 272 / 14 gb/s into the roofline, decode throughput for llama-3-8b (fp16,
 
 the takeaway the table makes concrete: on the 8 gb card fp16 *has* to offload ≥51%, so ~1.6 tok/s is its floor here; the ~3 tok/s figure is the same model at ~25% spill, which needs a 12 gb card or a gen4 x16 link. int4 sidesteps all of it — 4.3 gb fits, 0% offload, ~63 tok/s.
 
+![two-tier roofline](roofline/two-tier-roofline.png)
+
+left panel is the cliff: throughput against model footprint, with the 8 gb vram boundary as the vertical line — int4 sits left of it and runs at the vram slope, fp16 sits right and falls onto the pcie slope. right panel is the same prediction as a continuous curve over offload fraction, which is the line step 2 overlays real measurements onto.
+
+```
+python3 -m roofline.roofline2
+```
+
 ### step 2: does the curve land? (validated)
 
-swept `-ngl` 0→32 on llama-3.1-8b, int4 (q4_k_m, 4.9 gb) and int8 (q8_0, 8.5 gb), seq 2048, batch 1, decode timed with `llama-bench -d 2048` so the kv cache is full. each predicted line is drawn at the gguf's real on-disk bits/param (q4_k_m is 4.9, not 4.0). the measured points land on the roofline within **±6%** across the whole offload sweep. the model holds.
+swept `-ngl` 0→32 on llama-3.1-8b, int4 (q4_k_m, 4.9 gb) and int8 (q8_0, 8.5 gb), seq 2048, batch 1, decode timed with `llama-bench -d 2048` so the kv cache is full. each predicted line is drawn at the gguf's real on-disk bits/param (q4_k_m is 4.9, not 4.0). int4 lands within **±6%** across the whole offload sweep; int8 within **±11%**, worst at the fully-offloaded end. the split matters: the 48 gb/s slope is fitted on int4's ngl=0 point, so int4's fit is partly by construction and int8's curve is the out-of-sample one. the model holds on both, but int8 is the honest number to quote.
 
 ![two-tier roofline validation](roofline/validate-llamacpp.png)
 
@@ -61,6 +69,17 @@ but they land on a slope of **48 gb/s, not 14** — and that's the finding. llam
 the 14 gb/s in "the wall" above is still the right number for the engine's streaming path — it just isn't the number llama.cpp pays. both are real, they're different mechanisms.
 
 and the gap is why this matters instead of being a footnote: **at batch 1 cpu-offload (48) beats naive pcie-streaming (14) by 3.5x.** streaming to the gpu is a *losing* move at batch 1 — the engine only gets ahead once batching hides the pcie copy behind compute and the fast gpu takes over. the baseline being stronger than the naive floor is exactly what forces the next section.
+
+**llama.cpp already streams, and finding that out is what made this project sharper.** the first draft of the paragraph above said "streaming to the gpu is what *this* engine does" as though nobody else did it. that's wrong. `ggml/src/ggml-backend.cpp:919`: when an op's weights sit in a host buffer, the scheduler offers the op to a higher-priority backend, and `ggml/src/ggml-cuda/ggml-cuda.cu:5187` takes it whenever `get_op_batch_size(op) >= op_offload_min_batch_size`. that threshold is **hard-coded to 32** at `ggml-cuda.cu:5357` (`GGML_OP_OFFLOAD_MIN_BATCH` overrides it). it's a token count on the ubatch, not a phase check — so it fires on prefill *and* on batched decode, and never at batch 1.
+
+measured on q4_k_m, both at `-ngl 0`, so the layer placement is identical and only the tier differs:
+
+| run | tok/s | what's running |
+|---|---:|---|
+| `-p 512 -nopo 1` | 37.4 | pure cpu compute — the cpu's ceiling, **0.60 tflop/s** |
+| `-p 512` (default) | 855.4 | weights streamed over pcie, gpu computes |
+
+**23x, from the same weights in the same place, by choosing a different tier.** so the contribution isn't the mechanism, it's the policy: 32 is a constant somebody picked, not a number derived from a bandwidth, a flops ceiling or a tensor shape. writing down the equation it approximates is the thing nobody has done.
 
 (int8 has no 0%-offload point: at 8.5 gb it can't sit fully resident on 8 gb, so `-ngl 32` oversubscribes vram and the driver falls back to shared memory — dropped as an artifact. that unreachable corner is the cliff, live.)
 
@@ -92,6 +111,50 @@ but **at batch 1 there is almost no compute to hide behind.** that's the whole p
 
 what manufactures compute to hide the transfer behind? **batching.** not to serve many users, there's only one user here. to raise arithmetic intensity until the pcie copy disappears under the math.
 
+### step 2b: the batch axis, and where the tiers cross
+
+steps 1-2 measured one point on this axis — batch 1 — which is the single batch where the answer is uninteresting, because every tier is bandwidth bound there and the fastest bandwidth wins. the model had no compute term at all, so it *couldn't* have said anything else. adding one needs two ceilings that were never measured, and now are:
+
+| ceiling | value | how |
+|---|---:|---|
+| cpu compute | 0.60 tflop/s | `-ngl 0 -nopo 1 -p 512` → 37.4 tok/s × 2 × 8.03e9 |
+| gpu compute | 41.6 tflop/s | `-ngl 99 -p 512` → 2592 tok/s |
+
+**69x apart.** that ratio is the engine's entire thesis, and it's why the two tiers can't stay parallel:
+
+- **cpu-offload** reads each weight out of ddr5 once and then does b tokens of math with it. bandwidth bound at b=1 (108 ms of ddr5 vs 27 ms of math), **compute bound by b ≈ 3.8**, and flat at 37 tok/s forever after. more batch buys nothing.
+- **pcie-stream** moves the same weight bytes no matter what b is. gpu compute only catches the copy at b ≈ 910, so in any practical range the tier is copy-bound and throughput climbs *linearly*.
+
+one flattens, one climbs, so they cross:
+
+> **b\* = 14.** below it llama.cpp's cpu tier is genuinely the right call and streaming loses. above it streaming wins and keeps winning.
+
+![batch crossover](roofline/batch-crossover.png)
+
+**and llama.cpp switches at 32.** so between batch 14 and 31 it stays on a tier its own hardware says it should have left — costing up to **2.2x** at b=31. that band is not a hypothetical: it's where a single-user local engine with a few parallel requests, or speculative decoding, actually lives.
+
+the model earns the prediction by making one out-of-sample call first. `CPU_TFLOPS` is fitted on the 37.4 point and `CPU_BW` on the batch-1 decode point, but nothing about the streamed run is fitted — it's the 14 gb/s pcie slope from step 0 plus the gpu ceiling, added rather than maxed because llama.cpp's op offload copies then computes (the weight is a graph-split input, recopied every eval behind a `ggml_backend_synchronize`, `ggml-backend.cpp:1554-1580`):
+
+```
+pp512, op offload   measured 855.4 tok/s   predicted 836.4   -2.2%
+```
+
+which also prices the thing step 5 is for — and the price is batch dependent in a way worth being careful about. prefetching only recovers the compute that was serialised behind the copy, so it pays exactly where there's compute to hide:
+
+| | serialised (baseline) | prefetched | gain |
+|---|---:|---:|---:|
+| pp512 (prefill) | 612 ms | 415 ms | **1.48x** |
+| decode b=32, seq 2048 | 395 ms | 383 ms | 1.03x |
+| decode b=64, seq 2048 | 439 ms | 415 ms | 1.06x |
+
+so **prefetch is a prefill/large-batch optimisation, not the decode win.** in the 14-32 band the entire gain comes from picking the right tier, not from overlapping the copy. worth knowing before spending a month on a copy-stream pipeline for step 5.
+
+```
+python3 -m roofline.batch_crossover
+```
+
+**what's still modeled, not measured.** b\* itself. every input to it is measured, but the crossover has not been observed directly — that needs batched decode (`llama-batched-bench -npl 1..64`), which is the next run. quote b\* as a prediction until then.
+
 which means the whole project collapses into one argument:
 
 > model doesn't fit -> offload -> now pcie bound -> raise arithmetic intensity until compute hides the transfer -> that is exactly what quantization and batching do
@@ -102,9 +165,11 @@ three escapes from the memory wall, all in service of one goal, on one machine. 
 
 not a new algorithm. offloading is well trodden (flexgen, headinfer, specoffload) and every serious engine already has paging and continuous batching (vllm, sglang, exllamav3, mlc). **not claiming to have invented any of it.**
 
-what doesn't exist is the model. everyone who runs local models hits this cliff and reasons about it by folklore ("just fit it in vram"). nobody writes down the equation and checks it. so:
+what doesn't exist is the model. everyone who runs local models hits this cliff and reasons about it by folklore ("just fit it in vram"), and even the good engines encode the answer as a constant — llama.cpp's tier switch is the literal integer 32, identical on a gen4 x8 laptop and a threadripper with an a100, identical for a 4096×14336 mlp tensor and a 4096×1024 attention projection. nobody writes down the equation that constant is approximating and checks it. so:
 
 > given a bandwidth budget, a vram budget, a batch size and a sequence length: where does the cliff sit, which knob should you reach for, and does the roofline predict the answer before you run it?
+
+concretely, three claims, each falsifiable on hardware i own: (1) the tier switch is a function of four measured numbers and the tensor's shape, not a constant — on this machine it's **14, not 32**; (2) it differs per layer, so no single threshold is right for both the mlp and the attention tensors; (3) prefetching across layers is worth 1.48x at prefill and almost nothing at decode batch 32 — so tier selection, not overlap, is where the decode win is.
 
 the mechanism that makes it work is a **tiered, quantized block allocator**. location and precision are both properties of a block, not global settings:
 
@@ -170,7 +235,7 @@ load a model, kv cached greedy generate. the floor. two modes: batch 1, and stat
 fp16 baseline first so there's a number to beat, then w8a16: int8 weights, fp16 activations, per-channel scales, dequant fused in-register so a weight only ever crosses the bus as one byte. then fp8 e4m3 (sm_120 has native conversion, so int8 vs fp8 is a measurement here, not a guess).
 
 **5. offload + prefetch** - `placement.py`
-per-layer placement across vram/ram, double buffered, `cudaMemcpyAsync` on a dedicated copy stream. measure transfer/compute overlap directly. **expect it to disappoint at batch 1.** that's not a bug, it's the finding that motivates step 7.
+per-layer placement across vram/ram, double buffered, `cudaMemcpyAsync` on a dedicated copy stream. measure transfer/compute overlap directly. **expect it to disappoint at batch 1.** that's not a bug, it's the finding that motivates step 7. the target is priced: step 2b says overlapping the copy is worth 1.48x at prefill but only ~1.03x at decode b=32, so **placement is the win here and prefetch is the prefill win.** build the tier-selection policy first.
 
 **6. tiered paged kv cache** - `paged_cache.py`, `attention.cu`
 block allocator where each block carries a location and a precision. attention reads a non-contiguous, mixed-precision cache. at 8gb the cache genuinely runs out, so eviction is a real decision instead of a design doc.
@@ -195,8 +260,9 @@ cross-package imports resolve, e.g. `python3 -m roofline.validate_llamacpp`.
 setup.py               builds the cuda extension (top level: sees all kernels)
 
 roofline/              deliverable #1: the model + its validation
-  roofline2.py         the two tier model. the actual deliverable.
+  roofline2.py         the tier model: bandwidth AND compute ceiling per tier
   validate_llamacpp.py step 2 gate: overlay -ngl measurements on the prediction
+  batch_crossover.py   step 2b: sweep batch, find b*, price the prefetch headroom
 
 engine/                deliverable #2: the engine (the part that's mine)
   runner.py            the floor: batch 1 + static batching
