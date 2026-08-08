@@ -34,6 +34,15 @@ CPU_BW_GB_S = 48      # second offload tier. llama.cpp -ngl computes offloaded l
                       # the ngl=0 endpoint. see validate_llamacpp.py.
 VRAM_CAPACITY_GB = 8  # 5060 laptop has 8 GB (8151 MiB). sets where the cliff sits.
 
+# Compute ceilings. Batch 1 decode never touches these (1-2 flop/byte keeps every
+# tier bandwidth bound), which is why steps 1-2 could ignore them. Past batch ~4
+# the CPU tier goes compute bound and the bandwidth-only model stops predicting.
+# Both measured with llama-bench on Q4_K_M, effective flops = 2 * params * pp_tps:
+#   CPU: -ngl 0 -nopo 1 -p 512 -> 37.4 tok/s  (op offload disabled, pure CPU)
+#   GPU: -ngl 99      -p 512 -> 2592 tok/s   (fully resident)
+CPU_TFLOPS = 0.60
+GPU_TFLOPS = 41.6
+
 # The KV cache stays fp16 even when the weights are quantized to int8/int4, so
 # it gets its own precision independent of the `bits` weights are streamed at.
 KV_BITS = 16
@@ -53,6 +62,36 @@ class ModelConfig:
 # Reference targets. llama-3-8b is the one that makes the cliff sweepable:
 # fp16 ~16 GB spills, int8 ~8 GB on the knife edge, int4 ~4 GB fits with KV room.
 LLAMA3_8B = ModelConfig(name="llama-3-8b", num_layers=32, hidden_dim=4096, num_params=8_030_000_000, num_attention_heads = 32, num_kv_heads = 8)
+
+
+@dataclass
+class Tier:
+    """
+    Where an offloaded layer runs. A tier is a bandwidth AND a compute ceiling,
+    because which one binds flips with batch size — that flip is the whole point
+    of the batch sweep.
+
+    overlap says whether the weight movement hides under the math. True is a
+    prefetched copy stream (t = max), False is copy-then-compute (t = sum), which
+    is what llama.cpp's op offload does today: the weight is an input to the
+    graph split, recopied every eval behind a synchronize.
+
+    kv_follows_weights says whether an offloaded layer's KV cache goes with it.
+    It does under -ngl (the CPU computes that layer, so it reads its own KV out
+    of system RAM) and it does not under streaming (the weights come to the GPU,
+    the cache stays put).
+    """
+    name: str
+    bw_gb_s: float
+    tflops: float
+    overlap: bool = True
+    kv_follows_weights: bool = False
+
+
+TIER_RESIDENT = Tier("resident", VRAM_BW_GB_S, GPU_TFLOPS)
+TIER_CPU = Tier("cpu-offload", CPU_BW_GB_S, CPU_TFLOPS, kv_follows_weights=True)
+TIER_STREAM = Tier("pcie-stream", PCIE_BW_GB_S, GPU_TFLOPS)
+TIER_STREAM_NAIVE = Tier("pcie-stream (no prefetch)", PCIE_BW_GB_S, GPU_TFLOPS, overlap=False)
 
 
 def bytes_per_param(bits: int) -> float:
@@ -81,30 +120,62 @@ def footprint_bytes(model: ModelConfig, bits: int, seq_len: int, batch: int) -> 
     return weight_bytes(model, bits) + kv_bytes_per_token(model, seq_len, batch)
 
 
-def decode_time_per_token(model: ModelConfig, bits: int, offload_frac: float, seq_len: int, batch: int,
-                          offload_bw_gb_s: float = PCIE_BW_GB_S) -> float:
+def flops_per_step(model: ModelConfig, batch: int) -> float:
     """
-    The two-tier equation. offload_frac in [0,1] is the fraction of layers out of
-    VRAM; those bytes pay offload_bw, the rest pay VRAM_BW.
+    Arithmetic in one decode step: 2 flop per weight per token in the batch. The
+    term that was missing from steps 1-2. Flat in bytes, linear in batch, which
+    is why batching is the knob that changes which ceiling binds.
+    """
+    return 2 * model.num_params * batch
 
-        t = resident_bytes / VRAM_BW  +  offloaded_bytes / offload_bw
 
-    offload_bw is PCIE_BW (this engine's streaming path) or CPU_BW (llama.cpp -ngl).
+def tier_time(bytes_moved: float, flops: float, tier: Tier) -> float:
+    """
+    Time for one tier's share of a step. Bandwidth and compute are two ceilings
+    over the same work: with a prefetch stream the slower one sets the pace, and
+    without one they serialise.
+    """
+    t_bw = bytes_moved / (tier.bw_gb_s * 1e9)
+    t_compute = flops / (tier.tflops * 1e12)
+    return max(t_bw, t_compute) if tier.overlap else t_bw + t_compute
+
+
+def decode_time_per_token(model: ModelConfig, bits: int, offload_frac: float, seq_len: int, batch: int,
+                          offload_tier: Tier = TIER_STREAM) -> float:
+    """
+    The two-tier equation, now with a compute term on each tier:
+
+        t = tier_time(resident bytes, resident flops, RESIDENT)
+          + tier_time(offloaded bytes, offloaded flops, offload_tier)
+
+    At batch 1 both tiers are bandwidth bound and this reduces exactly to the
+    bandwidth-only sum steps 1-2 validated to +/-6%. Past batch ~4 the CPU tier's
+    flops bind and the two tiers stop being parallel lines.
+
+    KV is held resident even for streamed layers: weights are reread every step
+    so they have to cross the bus, the KV cache does not. That's a choice this
+    engine makes and llama.cpp's -ngl does not.
     """
     total_weights = weight_bytes(model, bits)
     total_kv = kv_bytes_per_token(model, seq_len, batch)
+    flops = flops_per_step(model, batch)
 
-    ram_bytes = (total_weights * offload_frac) + (total_kv * offload_frac)
-    vram_bytes = (total_weights * (1 - offload_frac)) + (total_kv * (1 - offload_frac))
+    if offload_tier.kv_follows_weights:
+        off_bytes = (total_weights + total_kv) * offload_frac
+        res_bytes = (total_weights + total_kv) * (1 - offload_frac)
+    else:
+        off_bytes = total_weights * offload_frac
+        res_bytes = total_weights * (1 - offload_frac) + total_kv
 
-    time = vram_bytes / (VRAM_BW_GB_S * 1e9) + ram_bytes / (offload_bw_gb_s * 1e9)
-    return time
+    t_res = tier_time(res_bytes, flops * (1 - offload_frac), TIER_RESIDENT)
+    t_off = tier_time(off_bytes, flops * offload_frac, offload_tier)
+    return t_res + t_off
 
 def predict_throughput(model: ModelConfig, bits: int, offload_frac: float, seq_len: int, batch: int,
-                       offload_bw_gb_s: float = PCIE_BW_GB_S) -> float:
+                       offload_tier: Tier = TIER_STREAM) -> float:
     """Predicted decode throughput in tokens/sec = batch / t_token."""
     # batch / (s / token * batch) = token / s
-    return batch / decode_time_per_token(model, bits, offload_frac, seq_len, batch, offload_bw_gb_s)
+    return batch / decode_time_per_token(model, bits, offload_frac, seq_len, batch, offload_tier)
 
 
 def offload_fraction(model: ModelConfig, bits: int, vram_gb: float, seq_len: int, batch: int) -> float:
@@ -152,7 +223,7 @@ def sweep_precision(model: ModelConfig, bits_list: list[int], vram_gb: float, se
 
 
 def sweep_offload_fraction(model: ModelConfig, bits: int, fracs_list: list[float], seq_len: int, batch: int,
-                           offload_bw_gb_s: float = PCIE_BW_GB_S) -> dict:
+                           offload_tier: Tier = TIER_STREAM) -> dict:
     """
     Force offload_frac from 0 to 1 and predict tokens/sec at each point. The curve
     Step 2 overlays llama.cpp -ngl measurements onto. Returns 'offload_frac', 'tps'.
@@ -161,11 +232,63 @@ def sweep_offload_fraction(model: ModelConfig, bits: int, fracs_list: list[float
     results = {"offload_frac": [], "tps": []}
 
     for frac in fracs_list:
-        tps = predict_throughput(model, bits, frac, seq_len, batch, offload_bw_gb_s)
+        tps = predict_throughput(model, bits, frac, seq_len, batch, offload_tier)
         results["offload_frac"].append(frac)
         results["tps"].append(tps)
 
     return results
+
+
+def sweep_batch(model: ModelConfig, bits: float, batches: list[int], seq_len: int, offload_frac: float,
+                offload_tier: Tier = TIER_STREAM) -> dict:
+    """
+    Step 2 measured one point on this axis (batch 1) and the whole argument for
+    the engine lives on the rest of it. Returns 'batch' and 'tps' for one tier;
+    run it per tier and compare the curves.
+    """
+
+    results = {"batch": [], "tps": []}
+
+    for batch in batches:
+        results["batch"].append(batch)
+        results["tps"].append(predict_throughput(model, bits, offload_frac, seq_len, batch, offload_tier))
+
+    return results
+
+
+def compute_bound_batch(model: ModelConfig, bits: float, tier: Tier, offload_frac: float = 1.0) -> float:
+    """
+    The batch where a tier stops being bandwidth bound and starts being compute
+    bound, i.e. where its throughput stops climbing and flattens:
+
+        bytes / BW  ==  2 * params * b / FLOPS
+
+    KV is left out so this is a property of the tier and the weights alone.
+    """
+    t_bw = weight_bytes(model, bits) * offload_frac / (tier.bw_gb_s * 1e9)
+    return t_bw * (tier.tflops * 1e12) / (2 * model.num_params * offload_frac)
+
+
+def crossover_batch(model: ModelConfig, bits: float, seq_len: int, offload_frac: float = 1.0,
+                    tier_a: Tier = TIER_CPU, tier_b: Tier = TIER_STREAM,
+                    max_batch: int = 4096) -> float | None:
+    """
+    b*: the batch where tier_b overtakes tier_a. Below it llama.cpp's CPU offload
+    is the right call and streaming to the GPU loses, above it the reverse. Found
+    by scan rather than algebra because each curve has a knee in it.
+
+    Returns None if they never cross below max_batch.
+    """
+    if predict_throughput(model, bits, offload_frac, seq_len, 1, tier_b) > \
+       predict_throughput(model, bits, offload_frac, seq_len, 1, tier_a):
+        return 1.0
+
+    for batch in range(2, max_batch + 1):
+        if predict_throughput(model, bits, offload_frac, seq_len, batch, tier_b) > \
+           predict_throughput(model, bits, offload_frac, seq_len, batch, tier_a):
+            return float(batch)
+
+    return None
 
 # --- plot -------------------------------------------------------------------
 
