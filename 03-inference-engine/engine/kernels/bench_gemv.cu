@@ -70,25 +70,24 @@ static const Shape SHAPES[] = {
  * The practical bandwidth ceiling: how fast can this card read memory when the
  * kernel does nothing else? Every gemv number below is reported as a fraction
  * of whatever this achieves, so it has to be the best possible reader.
- *
- * TODO 1. Read all `n` float4s from `src`. Two things decide whether this hits
- *         the real ceiling:
- *           - grid-stride loop (i += blockDim.x * gridDim.x) so a fixed grid
- *             covers any buffer size, and consecutive threads hit consecutive
- *             addresses
- *           - float4, not float: 16 bytes per load instruction. This is the
- *             difference between ~50% and ~90% of peak.
- *
- * TODO 2. Accumulate into a local float and guard the store behind a condition
- *         that is never true, e.g. `if (acc == 1.2345678e30f) sink[0] = acc;`.
- *         Without a store the compiler proves the loads are dead, deletes the
- *         whole loop, and you measure an empty kernel at infinite bandwidth.
- *
- * Until this is written the ceiling reads as ~0 ms and pct_practical is garbage.
  */
 __global__ void stream_read_kernel(const float4* __restrict__ src, float* __restrict__ sink, size_t n)
 {
-    (void)src; (void)sink; (void)n;
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = blockDim.x * gridDim.x;
+
+    float acc{};
+
+    for(; i < n; i+= stride) {
+
+        float4 vals = src[i];
+        acc += vals.x + vals.y + vals.z + vals.w;
+    }
+
+    // never true at runtime, but the compiler can't prove it, so the loads stay alive
+    if (acc == 1.2345678e30f) {
+        sink[0] = acc;
+    }
 }
 
 
@@ -212,24 +211,18 @@ int main()
         const double bytes_read = static_cast<double>(w_bytes);
         const double flops      = 2.0 * static_cast<double>(M) * K;
 
-        /*
-         * TODO 3. Launch config, and it must mirror gemv_fp16_kernel exactly.
-         *         The kernel maps one WARP to one output row, not one block, so
-         *         the grid is ceil(M / warps_per_block) -- launching M blocks
-         *         computes 8x the rows you have and walks off the end of y.
-         *
-         * TODO 4. shared_x is `extern __shared__`, so its size is a launch
-         *         parameter, not a compile-time one. Pass K * sizeof(half) as
-         *         the third config argument. Pass 0 and every write into
-         *         shared_x is out of bounds -- silent corruption, not an error.
-         *
-         * TODO 5. Guard the shapes you cannot serve: if K * sizeof(half)
-         *         exceeds the 48 KB default shared-memory cap, print a skip
-         *         line to stderr and `continue` BEFORE allocating anything.
-         */
+        // mirrors gemv_fp16_kernel: one warp per output row, x tiled in dynamic shared
         constexpr int THREADS = 256;
-        const int blocks_gemv = 0;   // replace
-        const size_t shmem    = 0;   // replace
+        constexpr int WARPS_PER_BLOCK = THREADS / 32;
+
+        const size_t shmem = static_cast<size_t>(K) * sizeof(half);
+
+        if (shmem > 48 * 1024) {
+            std::fprintf(stderr, "skip %s: K=%d needs %zu B shared, over the 48 KB cap\n", s.name, K, shmem);
+            continue;
+        }
+
+        const int blocks_gemv = (M + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
 
         // Small magnitudes keep the fp32 accumulator inside fp16 range after K adds.
         std::vector<half> h_W(w_elems);

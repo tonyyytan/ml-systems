@@ -1,6 +1,7 @@
 # Build outputs
 01-matmul-roofline/roofline
 02-operator-fusion/kernels
+03-inference-engine/bench_gemv
 *.o
 
 # PyTorch / setuptools extension build
