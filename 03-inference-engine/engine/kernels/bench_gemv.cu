@@ -156,7 +156,7 @@ int main()
     cudaDeviceProp prop{};
     CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
 
-    // Cross-check on the hardcoded 272. If these disagree, trust neither yet.
+    // Cross-check on the hardcoded peak. If these disagree, trust neither yet.
     const double derived_peak_gb_s =
         2.0 * static_cast<double>(prop.memoryClockRate) * 1e3 *
         (static_cast<double>(prop.memoryBusWidth) / 8.0) / 1e9;

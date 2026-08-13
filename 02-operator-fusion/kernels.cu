@@ -21,7 +21,7 @@
 #include <algorithm>
 
 // RTX 5060 Laptop GPU (Blackwell GB206)
-static constexpr double PEAK_BW_GB_S = 272.0;
+static constexpr double PEAK_BW_GB_S = 384.0;
 
 #define CUDA_CHECK(call)                                                          \
     do {                                                                          \

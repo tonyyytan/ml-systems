@@ -49,7 +49,7 @@ def plot(csv_path):
         axes = [axes]
 
     # GB/s RTX 5060 laptop
-    peak_bw = 272.0
+    peak_bw = 384.0
 
     for ax, (kernel, variants) in zip(axes, data.items()):
         color = KERNEL_COLOR.get(kernel, None)

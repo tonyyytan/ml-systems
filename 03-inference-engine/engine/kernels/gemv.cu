@@ -10,7 +10,7 @@
  * This IS decode at batch 1. Every weight is read exactly once and used for
  * exactly one multiply-add: 2 flops per 2 bytes = 1 flop/byte. The GPU can do
  * hundreds of flops per byte delivered, so it starves. The kernel is bound by
- * memory bandwidth (272 GB/s on this card), NOT by arithmetic.
+ * memory bandwidth (384 GB/s peak on this card), NOT by arithmetic.
  *
  * Consequence: the ONLY figure of merit here is achieved bandwidth.
  *     GB/s = bytes_read / seconds        bytes_read = M * K * sizeof(weight)
@@ -19,7 +19,7 @@
  *
  * Build order in this file, each one a separate measurement:
  *   1. gemv_fp16   -- baseline. no quantization. exists to give an honest
- *                     number to beat and to prove we can approach 272 GB/s.
+ *                     number to beat and to prove we can approach the ceiling.
  *   2. gemv_w8a16  -- int8 weights, fp16 activations, dequant FUSED IN-REGISTER.
  *   3. gemv_w8a16_fp8 -- same bytes as int8, fp8 e4m3 encoding instead.
  *
@@ -42,8 +42,10 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
-// RTX 5060 Laptop GPU (Blackwell GB206). The ceiling everything is measured against.
-static constexpr double PEAK_BW_GB_S = 272.0;
+// RTX 5060 Laptop GPU (Blackwell GB206): 128-bit GDDR7 @ 24 Gbps.
+// Theoretical, so nothing reaches it -- bench_gemv measures the real ceiling
+// with a pure read kernel (~362 GB/s, 94% of this) and reports against both.
+static constexpr double PEAK_BW_GB_S = 384.0;
 
 
 /* ---------------------------------------------------------------------------
