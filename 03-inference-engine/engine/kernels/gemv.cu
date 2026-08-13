@@ -91,7 +91,6 @@ __global__ void gemv_fp16_kernel(const half* __restrict__ W, const half* __restr
     __syncthreads();
 
     int row = blockIdx.x * warps_per_block + warp_id;
-    // int col = 1 (uninitialized)
 
     if (row < M) {
 
@@ -114,12 +113,71 @@ __global__ void gemv_fp16_kernel(const half* __restrict__ W, const half* __restr
 
 
 /*
+ * Same mapping as above, but 16 bytes per load instruction instead of 2.
+ * A float4 is 8 halves, so one instruction covers what took eight before and
+ * the warp still walks the row contiguously (lane l takes float4 l, l+32, ...).
+ *
+ * Needs K % 8 == 0 and a 16-byte-aligned row start; K % 8 == 0 gives both,
+ * since a row is K * 2 bytes and torch allocations are 512-byte aligned.
+ */
+__global__ void gemv_fp16_vec_kernel(const half* __restrict__ W, const half* __restrict__ x, half* __restrict__ y, int M, int K) {
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    int warps_per_block = blockDim.x / 32;
+
+    extern __shared__ __align__(16) half shared_x[];
+
+    const int k4 = K / 8;
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    float4* sx4 = reinterpret_cast<float4*>(shared_x);
+
+    for (int j{tid}; j < k4; j += blockDim.x) {
+        sx4[j] = x4[j];
+    }
+    __syncthreads();
+
+    int row = blockIdx.x * warps_per_block + warp_id;
+
+    if (row < M) {
+
+        const float4* w4 = reinterpret_cast<const float4*>(W + static_cast<size_t>(row) * K);
+
+        float thread_sum{};
+
+        for (int j{lane_id}; j < k4; j += 32) {
+            float4 wv = w4[j];
+            float4 xv = sx4[j];
+
+            const half2* wh = reinterpret_cast<const half2*>(&wv);
+            const half2* xh = reinterpret_cast<const half2*>(&xv);
+
+            #pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                float2 a = __half22float2(wh[t]);
+                float2 b = __half22float2(xh[t]);
+                thread_sum += a.x * b.x + a.y * b.y;
+            }
+        }
+
+        for (int offset = 16; offset > 0; offset /= 2) {
+            thread_sum += __shfl_down_sync(0xffffffff, thread_sum, offset);
+        }
+
+        if (lane_id == 0) {
+            y[row] = __float2half(thread_sum);
+        }
+    }
+}
+
+
+/*
  * Host-side launcher. This is what Python calls.
  *
  * Returns y (M,) fp16 on the same device as W.
  */
 #ifdef TORCH_EXTENSION
-torch::Tensor gemv_fp16(torch::Tensor W, torch::Tensor x)
+static torch::Tensor gemv_fp16_launch(torch::Tensor W, torch::Tensor x, bool vectorized)
 {
     TORCH_CHECK(W.is_cuda() && x.is_cuda(), "W and x must be CUDA tensors");
 
@@ -144,22 +202,36 @@ torch::Tensor gemv_fp16(torch::Tensor W, torch::Tensor x)
 
     TORCH_CHECK(shmem <= 48 * 1024, "K=", K, " needs ", shmem, " B of shared memory, over the 48 KB default cap");
 
+    TORCH_CHECK(!vectorized || K % 8 == 0, "vectorized path needs K % 8 == 0 (float4 = 8 halves), got K=", K);
+
     //output
     auto y = torch::empty({M}, W.options());
     const int blocks = (M + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
 
-    gemv_fp16_kernel<<<blocks, THREADS, shmem, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const half*>(W.data_ptr<at::Half>()),
-        reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(y.data_ptr<at::Half>()),   // NOT const: this is the output
-        M, K);
+    auto W_ptr = reinterpret_cast<const half*>(W.data_ptr<at::Half>());
+    auto x_ptr = reinterpret_cast<const half*>(x.data_ptr<at::Half>());
+    // NOT const: this is the output
+    auto y_ptr = reinterpret_cast<half*>(y.data_ptr<at::Half>());
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    if (vectorized) {
+        gemv_fp16_vec_kernel<<<blocks, THREADS, shmem, stream>>>(W_ptr, x_ptr, y_ptr, M, K);
+    } else {
+        gemv_fp16_kernel<<<blocks, THREADS, shmem, stream>>>(W_ptr, x_ptr, y_ptr, M, K);
+    }
 
     C10_CUDA_CHECK(cudaGetLastError());
     return y;
 }
 
+torch::Tensor gemv_fp16(torch::Tensor W, torch::Tensor x) { return gemv_fp16_launch(W, x, false); }
+
+torch::Tensor gemv_fp16_vec(torch::Tensor W, torch::Tensor x) { return gemv_fp16_launch(W, x, true); }
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("gemv_fp16", &gemv_fp16, "fp16 GEMV (y = W @ x), batch-1 decode shape");
+    m.def("gemv_fp16", &gemv_fp16, "fp16 GEMV (y = W @ x), scalar half loads");
+    m.def("gemv_fp16_vec", &gemv_fp16_vec, "fp16 GEMV (y = W @ x), float4 loads");
     // step 4b: m.def("gemv_w8a16", ...)
     // step 4c: m.def("gemv_w8a16_fp8", ...)
 }

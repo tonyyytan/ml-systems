@@ -217,6 +217,11 @@ int main()
 
         const size_t shmem = static_cast<size_t>(K) * sizeof(half);
 
+        if (K % 8 != 0) {
+            std::fprintf(stderr, "skip %s: K=%d not a multiple of 8, vec path needs float4 rows\n", s.name, K);
+            continue;
+        }
+
         if (shmem > 48 * 1024) {
             std::fprintf(stderr, "skip %s: K=%d needs %zu B shared, over the 48 KB cap\n", s.name, K, shmem);
             continue;
@@ -257,26 +262,57 @@ int main()
                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
         };
 
+        // cuBLAS has no plain fp16 gemv; the only one is the batched form, so
+        // batchCount=1. HSH = half in, fp32 compute, half out, and alpha/beta
+        // are float* for that variant. A is stored (m,n) = (K,M), so OP_T.
+        auto launch_cublas_gemv = [&] {
+            CUBLAS_CHECK(cublasHSHgemvStridedBatched(
+                handle, CUBLAS_OP_T,
+                K, M,
+                &alpha,
+                d_W, K, 0,
+                d_x, 1, 0,
+                &beta,
+                d_y, 1, 0,
+                1));
+        };
+
         auto launch_gemv = [&] {
             gemv_fp16_kernel<<<blocks_gemv, THREADS, shmem>>>(d_W, d_x, d_y, M, K);
         };
 
+        auto launch_gemv_vec = [&] {
+            gemv_fp16_vec_kernel<<<blocks_gemv, THREADS, shmem>>>(d_W, d_x, d_y, M, K);
+        };
+
         launch_cublas();
-        launch_gemv();
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaGetLastError());
 
         std::vector<half> h_y(M), h_y_ref(M);
-        CUDA_CHECK(cudaMemcpy(h_y.data(), d_y, M * sizeof(half), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(h_y_ref.data(), d_y_ref, M * sizeof(half), cudaMemcpyDeviceToHost));
 
-        const double err = max_rel_err(h_y, h_y_ref);
-        if (err > 5e-2) {
-            std::fprintf(stderr, "WARNING %s: max rel err %.4f vs cuBLAS\n", s.name, err);
-        }
+        // one correctness check per variant, each against the same cuBLAS output
+        auto check = [&](const char* variant, auto&& launch) {
+            launch();
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpy(h_y.data(), d_y, M * sizeof(half), cudaMemcpyDeviceToHost));
+            double e = max_rel_err(h_y, h_y_ref);
+            if (e > 5e-2) {
+                std::fprintf(stderr, "WARNING %s/%s: max rel err %.4f vs cuBLAS\n", s.name, variant, e);
+            }
+            return e;
+        };
 
-        Timing t_gemv   = time_kernel(launch_gemv, d_flush, flush_bytes);
-        Timing t_cublas = time_kernel(launch_cublas, d_flush, flush_bytes);
+        const double err     = check("fp16_scalar", launch_gemv);
+        const double err_vec = check("fp16_vec", launch_gemv_vec);
+        const double err_cbv = check("cublas_gemv", launch_cublas_gemv);
+
+        Timing t_gemv       = time_kernel(launch_gemv, d_flush, flush_bytes);
+        Timing t_gemv_vec   = time_kernel(launch_gemv_vec, d_flush, flush_bytes);
+        Timing t_cublas     = time_kernel(launch_cublas, d_flush, flush_bytes);
+        Timing t_cublas_gv  = time_kernel(launch_cublas_gemv, d_flush, flush_bytes);
 
         auto emit = [&](const char* variant, const Timing& t, double rel_err) {
             const double gbs_med = bytes_read / (t.median_ms * 1e-3) / 1e9;
@@ -290,15 +326,20 @@ int main()
         };
 
         emit("fp16_scalar", t_gemv, err);
-        emit("cublas", t_cublas, 0.0);
+        emit("fp16_vec", t_gemv_vec, err_vec);
+        emit("cublas_gemm", t_cublas, 0.0);
+        emit("cublas_gemv", t_cublas_gv, err_cbv);
         std::fflush(stdout);
 
         const double ours_gbs   = bytes_read / (t_gemv.min_ms * 1e-3) / 1e9;
+        const double vec_gbs    = bytes_read / (t_gemv_vec.min_ms * 1e-3) / 1e9;
         const double cublas_gbs = bytes_read / (t_cublas.min_ms * 1e-3) / 1e9;
-        std::fprintf(stderr, "%-9s M=%5d K=%5d  ours %6.1f GB/s (%4.1f%% practical)   "
-                             "cublas %6.1f GB/s   err %.1e\n",
-                     s.name, M, K, ours_gbs,
-                     100.0 * ours_gbs / practical_peak_gb_s, cublas_gbs, err);
+        std::fprintf(stderr, "%-9s M=%5d K=%5d  scalar %6.1f GB/s (%4.1f%%)   "
+                             "vec %6.1f GB/s (%4.1f%%)   cublas %6.1f GB/s   err %.1e / %.1e\n",
+                     s.name, M, K,
+                     ours_gbs, 100.0 * ours_gbs / practical_peak_gb_s,
+                     vec_gbs, 100.0 * vec_gbs / practical_peak_gb_s,
+                     cublas_gbs, err, err_vec);
 
         CUDA_CHECK(cudaFree(d_W));
         CUDA_CHECK(cudaFree(d_x));
