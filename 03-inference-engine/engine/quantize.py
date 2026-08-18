@@ -62,26 +62,23 @@ SCALE_EPS = 1e-8
 
 
 def quantize_w8a16(W: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-channel symmetric int8. Returns (q, s).
+    #fp32 for accurate calc
+    W_fp32 = W.to(torch.float32)
 
-    in   W : (M, K) fp16 or fp32, any device
-    out  q : (M, K) int8, contiguous, row-major   <- what the kernel reads
-         s : (M,)   fp16                          <- one scale per output row
+    #abs max
+    amax = W_fp32.abs().max(dim=1).values
 
-    Steps:
-      1. amax = |W| max over dim=1, computed in FP32. This runs once, and the
-         division that follows is precision-sensitive in a way the max is not.
-      2. s = amax / QMAX, clamped up to SCALE_EPS.
-      3. q = round(W_fp32 / s[:, None]) clamped to [-QMAX, QMAX], cast to int8.
-      4. return q.contiguous() and s.half().
+    #scale factor
+    s = torch.clamp(amax / QMAX, min = SCALE_EPS)
 
-    torch.round is round-half-to-even, which is what the C++ side gets from
-    rintf. Do not swap it for floor(x + 0.5).
-    """
-    raise NotImplementedError  # TODO
+    #new scaled weights
+    q = torch.clamp(torch.round(W_fp32 / s[:, None]), min = -QMAX, max = QMAX)
+    q = torch.to(torch.int8)
 
+    return q.contigous(), s.half()
 
 def dequantize_w8a16(q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+
     """Reconstruct W_hat = s * q. Returns (M, K) fp16.
 
     Only the reference path uses this -- the KERNEL never materializes W_hat,
@@ -90,7 +87,14 @@ def dequantize_w8a16(q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
 
     Multiply in fp32, then cast down. s[:, None] broadcasts over k.
     """
-    raise NotImplementedError  # TODO
+
+    q_fp32 = q.to(torch.float32)
+    s_fp32 = s.to(torch.float32)
+
+    W_hat = s_fp32[:, None] * q_fp32
+    W_hat = W_hat.to(torch.fp16)
+
+    return W_hat
 
 
 def quant_error(W: torch.Tensor, W_hat: torch.Tensor, x: torch.Tensor | None = None) -> dict:
@@ -108,6 +112,11 @@ def quant_error(W: torch.Tensor, W_hat: torch.Tensor, x: torch.Tensor | None = N
 
     Compute all of it in fp32. If x is None, draw a standard normal (K,).
     """
+    W_hat_fp32 = W_hat.to(torch.float32)
+    W_hat
+    max_abs_rel = (W_hat - W).abs().max() / W.abs().max()
+
+
     raise NotImplementedError  # TODO
 
 
