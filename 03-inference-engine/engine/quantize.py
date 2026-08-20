@@ -73,9 +73,9 @@ def quantize_w8a16(W: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
     #new scaled weights
     q = torch.clamp(torch.round(W_fp32 / s[:, None]), min = -QMAX, max = QMAX)
-    q = torch.to(torch.int8)
+    q = q.to(torch.int8)
 
-    return q.contigous(), s.half()
+    return q.contiguous(), s.half()
 
 def dequantize_w8a16(q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
 
@@ -92,7 +92,7 @@ def dequantize_w8a16(q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
     s_fp32 = s.to(torch.float32)
 
     W_hat = s_fp32[:, None] * q_fp32
-    W_hat = W_hat.to(torch.fp16)
+    W_hat = W_hat.to(torch.float16)
 
     return W_hat
 
@@ -104,20 +104,46 @@ def quant_error(W: torch.Tensor, W_hat: torch.Tensor, x: torch.Tensor | None = N
                   (~1/255 = 0.4%) and is the least informative of the three.
     rms_rel       ||W_hat - W|| / ||W||. The representative elementwise number.
     out_rel       ||W_hat@x - W@x|| / ||W@x||, plus cosine similarity, for a
-                  random x. THIS is the one that predicts model quality, and it
-                  should come out far better than max_abs_rel because K
-                  independent rounding errors partially cancel (~sqrt(K)
-                  suppression). The gap between out_rel and max_abs_rel is a
-                  result worth putting in the README.
+                  random x. THIS is the one that predicts model quality.
+                  It comes out equal to rms_rel, NOT better: the K rounding
+                  errors do add in quadrature and grow as sqrt(K), but ||W@x||
+                  grows as sqrt(K) too, so the ratio is unchanged. Averaging
+                  buys absolute accuracy, not relative. cos_sim is the number
+                  worth quoting (~0.99997) since direction is what the next
+                  layer sees, and it is far more forgiving than the magnitudes.
 
     Compute all of it in fp32. If x is None, draw a standard normal (K,).
     """
+    #fp32 so the error is not itself rounded
+    W_fp32 = W.to(torch.float32)
     W_hat_fp32 = W_hat.to(torch.float32)
-    W_hat
-    max_abs_rel = (W_hat - W).abs().max() / W.abs().max()
 
+    err = W_hat_fp32 - W_fp32
 
-    raise NotImplementedError  # TODO
+    #worst single weight, normalised by the largest weight in the tensor
+    max_abs_rel = (err.abs().max() / W_fp32.abs().max()).item()
+
+    #the representative elementwise number
+    rms_rel = (err.norm() / W_fp32.norm()).item()
+
+    if x is None:
+        x = torch.randn(W.size(1), generator = torch.Generator().manual_seed(0))
+
+    x_fp32 = x.to(torch.float32)
+
+    #what the kernel actually produces, where the rounding errors cancel
+    y = W_fp32 @ x_fp32
+    y_hat = W_hat_fp32 @ x_fp32
+
+    out_rel = ((y_hat - y).norm() / y.norm()).item()
+    cos_sim = torch.nn.functional.cosine_similarity(y_hat, y, dim = 0).item()
+
+    return {
+        "max_abs_rel": max_abs_rel,
+        "rms_rel": rms_rel,
+        "out_rel": out_rel,
+        "cos_sim": cos_sim,
+    }
 
 
 # llama-3-8b per-layer projections, d_model=4096, d_ffn=14336, 8 kv heads.
@@ -142,7 +168,19 @@ def main():
 
     Seed the RNG so the table is reproducible.
     """
-    raise NotImplementedError  # TODO
+    torch.manual_seed(0)
+
+    print(f"{'shape':<10} {'M':>6} {'K':>6} {'max_abs_rel':>12} {'rms_rel':>10} {'out_rel':>10} {'cos_sim':>10}")
+
+    for name, M, K in SHAPES:
+        W = torch.randn(M, K, dtype = torch.float16)
+
+        q, s = quantize_w8a16(W)
+        W_hat = dequantize_w8a16(q, s)
+
+        e = quant_error(W, W_hat)
+
+        print(f"{name:<10} {M:>6} {K:>6} {e['max_abs_rel']:>12.5f} {e['rms_rel']:>10.5f} {e['out_rel']:>10.5f} {e['cos_sim']:>10.6f}")
 
 
 if __name__ == "__main__":
