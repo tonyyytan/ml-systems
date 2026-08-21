@@ -1,6 +1,6 @@
 # 03 inference engine
 
-in progress. this is the capstone. the tier roofline (steps 1-2b) is done and validated against llama.cpp — including the batch axis, where it predicts the tier crossover at **b\* = 14** against llama.cpp's hard-coded 32. the runner floor (step 3) generates tokens. step 4, the quantized gemv, is in progress — fp16 kernel written, host launcher not wired up yet.
+in progress. this is the capstone. the tier roofline (steps 1-2b) is done and validated against llama.cpp — including the batch axis, where it predicts the tier crossover at **b\* = 14** against llama.cpp's hard-coded 32. the runner floor (step 3) generates tokens. step 4, the quantized gemv, is half done: the fp16 baseline is written, wired to python, and benchmarked against cublas (321 gb/s, 96% of the measured ceiling on o_proj), and the int8 quantization contract is fixed. the fused-dequant kernel is next.
 
 ## what it is
 
@@ -271,10 +271,10 @@ sweep `-ngl` from 0 to all layers on a model that doesn't fit. measure tokens/se
 **3. model runner** - `runner.py` — **done**
 load a model, kv cached greedy generate. the floor. two modes: batch 1, and static batching (pad to longest, wait for the slowest, contiguous max-length kv per sequence). the static mode matters: without it the final chart can only prove "batching helps", which nobody doubts, instead of "my batching is good", which is the actual claim. both paths work; the smoke test asserts the batched slots match batch-1 exactly, since greedy is deterministic. `MODEL_ID` still needs pinning to the roofline's model.
 
-**4. quantized gemv** - `gemv.cu`, `quantize.py` — **in progress**
+**4. quantized gemv** - `gemv.cu`, `quantize.py`, `bench_gemv.cu` — **fp16 baseline done, w8a16 next**
 fp16 baseline first so there's a number to beat, then w8a16: int8 weights, fp16 activations, per-channel scales, dequant fused in-register so a weight only ever crosses the bus as one byte. then fp8 e4m3 (sm_120 has native conversion, so int8 vs fp8 is a measurement here, not a guess).
 
-the fp16 kernel is written (one warp per row, shared-memory `x` tile, warp shuffle reduction). still open: the host launcher is a stub, so nothing is callable from python yet; the shared tile is *dynamic* (`extern __shared__`) so the launch must pass `K * sizeof(half)` as the third config arg or every write is out of bounds; the grid is `ceil(M/8)` for the warp-per-row mapping, not `M`; and `Makefile`'s `bench_gemv.cu` doesn't exist yet, so only `make ext` works. the measurement gate stands: no w8a16 until fp16 clears ~85% of 272 gb/s, because a quantization speedup against a bad baseline means nothing.
+the fp16 kernel is done: one warp per row, `x` staged in dynamic shared memory, warp shuffle reduction, fp32 accumulator, in two variants (scalar `half` loads and `float4` loads). `bench_gemv.cu` sweeps the five decode shapes against cublas `GemmEx` and `HSHgemvStridedBatched` with l2 flushed between iterations; see `gemv_results.csv`. vectorizing the loads is worth 5-31%, largest on the small `kv_proj` shape where the scalar kernel cannot keep enough loads in flight. against the 334 gb/s measured pure-read ceiling (384 spec), the vectorized kernel runs 271-321 gb/s, matching or beating cublas on the three smaller shapes and landing ~3% behind on the two large ones. that clears the measurement gate, so w8a16 can start: no quantized kernel until the fp16 baseline is near the ceiling, because a quantization speedup against a bad baseline means nothing. `quantize.py` fixes the layout contract the kernel will be written against (per-channel symmetric int8, absmax rtn, cos_sim 0.99996 on random normal weights); the host-side quantizer in `bench_gemv.cu` still has to mirror it exactly.
 
 **5. offload + prefetch** - `placement.py`
 per-layer placement across vram/ram, double buffered, `cudaMemcpyAsync` on a dedicated copy stream. measure transfer/compute overlap directly. **expect it to disappoint at batch 1** — that's not a bug, it's the 3.5x gap from step 2 showing up in the engine, and it's the finding that motivates step 7. the target is priced: step 2b says overlapping the copy is worth 1.48x at prefill but only ~1.03x at decode b=32, so **placement is the win here and prefetch is the prefill win.** build the tier-selection policy first, then measure b\* on the real engine against the predicted 14.
@@ -313,14 +313,14 @@ roofline/              deliverable #1: the model + its validation
 
 engine/                deliverable #2: the engine (the part that's mine)
   runner.py            the floor: batch 1 + static batching
-  quantize.py          todo: per-channel scales + weight packing
+  quantize.py          per-channel symmetric int8 scales + the layout contract
   placement.py         todo: three-tier layer placement + prefetch streams
   paged_cache.py       todo: block allocator, location + precision per block
   scheduler.py         todo: continuous batching
   engine.py            todo, mine: ties placement, cache, scheduler and kernels together
   kernels/
-    gemv.cu            fp16 / int8 / fp8 fused dequant matvec (fp16 kernel written)
-    bench_gemv.cu      todo: standalone bandwidth harness (Makefile expects it)
+    gemv.cu            fp16 / int8 / fp8 fused dequant matvec (fp16 done, int8 next)
+    bench_gemv.cu      standalone bandwidth harness, cublas-checked, csv out
     attention.cu       todo: attention over the tiered paged cache
 
 bench/                 ties it together
