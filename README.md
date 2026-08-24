@@ -1,6 +1,6 @@
 # ml-systems
 
-me working through gpu and ml-systems stuff on a laptop rtx 5060 (blackwell gb206, 272 gb/s peak bandwidth). each folder is a self contained project.
+me working through gpu and ml-systems stuff on a laptop rtx 5060 (blackwell gb206, 384 gb/s peak bandwidth). each folder is a self contained project.
 
 the thread running through all of them is the roofline: is a given workload limited by compute or by memory bandwidth, and what do you do about it. order goes hardware -> kernels -> real model.
 

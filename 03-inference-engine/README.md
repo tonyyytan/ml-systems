@@ -1,6 +1,6 @@
 # 03 inference engine
 
-in progress. this is the capstone. the tier roofline (steps 1-2b) is done and validated against llama.cpp — including the batch axis, where it predicts the tier crossover at **b\* = 14** against llama.cpp's hard-coded 32. the engine is next.
+in progress. this is the capstone. the tier roofline (steps 1-2b) is done and validated against llama.cpp — including the batch axis, where it predicts the tier crossover at **b\* = 14** against llama.cpp's hard-coded 32. the runner floor (step 3) generates tokens. step 4, the quantized gemv, is done through w8a16: int8 weights with dequant fused in-register run 1.9-2.0x the fp16 baseline, which itself sits at 90-101% of the measured bandwidth ceiling. fp8 e4m3 is next.
 
 ## what it is
 
@@ -111,6 +111,28 @@ but **at batch 1 there is almost no compute to hide behind.** that's the whole p
 
 what manufactures compute to hide the transfer behind? **batching.** not to serve many users, there's only one user here. to raise arithmetic intensity until the pcie copy disappears under the math.
 
+### three tiers, and the one that scales
+
+step 2 split "offload" into two different mechanisms, so a spilled layer has three possible homes, not two:
+
+| tier | weights live | compute happens | slope | cost as batch b grows |
+|------|--------------|-----------------|------:|-----------------------|
+| resident | vram | gpu | 272 gb/s | flat |
+| cpu-offload | system ram | **cpu** | 48 gb/s | **grows with b** |
+| pcie-stream | system ram | **gpu** | 14 gb/s | **flat in b** |
+
+that last column is the whole argument, and it does not follow from the slopes.
+
+**cpu-offload** streams each weight out of ddr5 exactly once, then the cpu does all b tokens' arithmetic with it. at b=1 that arithmetic is trivial and the tier is purely bandwidth bound — which is exactly why the 48 gb/s slope fits llama.cpp to ±6%. as b rises the arithmetic stops being trivial and the cpu's own flops become the binding term instead of ddr5. **cost per token stops falling and starts rising.**
+
+**pcie-stream** moves the same bytes no matter what b is — the transfer is a property of the weights, not of the batch. meanwhile gpu compute grows with b, so the copy gets progressively easier to hide, and past some point it disappears under the math entirely. **cost per token is flat in b, then free.**
+
+one curve rising, one flat, starting 3.5x apart at batch 1. **they cross.** that crossover batch size b\* is a specific number on this machine:
+
+> below b\*, cpu-offload wins and streaming to the gpu is the losing move. above b\*, streaming wins and a fixed `-ngl` layer split is leaving throughput on the table.
+
+this section used to end by admitting that b\* was hand-waving, because the cpu's *compute* ceiling had never been measured and b\* is precisely where that ceiling binds. step 2b measures it.
+
 ### step 2b: the batch axis, and where the tiers cross
 
 steps 1-2 measured one point on this axis — batch 1 — which is the single batch where the answer is uninteresting, because every tier is bandwidth bound there and the fastest bandwidth wins. the model had no compute term at all, so it *couldn't* have said anything else. adding one needs two ceilings that were never measured, and now are:
@@ -155,9 +177,22 @@ python3 -m roofline.batch_crossover
 
 **what's still modeled, not measured.** b\* itself. every input to it is measured, but the crossover has not been observed directly — that needs batched decode (`llama-batched-bench -npl 1..64`), which is the next run. quote b\* as a prediction until then.
 
+### so the policy is an argmin, not a blend
+
+knowing b\* turns placement into a decision rule. it isn't a blend of the two engines, it's an **argmin over three tiers, per layer, under a vram budget.** per *layer* because layers aren't uniform — the mlp tensors are ~2.5x the attention projections, so they carry different transfer/compute ratios and land on opposite sides of b\*. one global threshold of 32 cannot be right for both.
+
+and placement needn't be integer. split a single weight matrix **by rows** — some rows resident, some streamed — and the offload fraction becomes continuous instead of stair-stepped, which is what turns the prediction from an approximation into a fit. finer grained than anything `-ngl` exposes.
+
+### the catch, stated up front
+
+**b\* = 14, which is greater than 1.** at batch 1 — the actual local single-user case — cpu-offload wins and this engine's streaming path *loses*, by 3.5x. that isn't a bug to fix, it's a consequence of decode having no compute to hide behind, and it constrains what the result can be:
+
+- the headline is a **throughput curve over batch size with a crossover on it**, not a latency win at batch 1. claiming the latter would require beating llama.cpp in the one regime where the physics says it's already right.
+- the only ways a single local user manufactures batch > 1 are parallel sampling and **speculative decoding**. so step 9 is not a stretch goal — it's what makes the hybrid pay off for the use case that motivated the project.
+
 which means the whole project collapses into one argument:
 
-> model doesn't fit -> offload -> now pcie bound -> raise arithmetic intensity until compute hides the transfer -> that is exactly what quantization and batching do
+> model doesn't fit -> offload -> now there are three tiers, not one -> they rank differently at different batch sizes -> raise arithmetic intensity until the fast tier wins -> that is exactly what quantization and batching do
 
 three escapes from the memory wall, all in service of one goal, on one machine. that's the paper.
 
@@ -169,15 +204,19 @@ what doesn't exist is the model. everyone who runs local models hits this cliff 
 
 > given a bandwidth budget, a vram budget, a batch size and a sequence length: where does the cliff sit, which knob should you reach for, and does the roofline predict the answer before you run it?
 
+**and specifically: where is b\*?** the two engines that bracket this problem each pick one tier and stay there. llama.cpp is cpu-offload with a static, hand-chosen split and no batch-size awareness (`-ot` / `--n-cpu-moe` add per-tensor control, but a human still picks it). flexgen solves a real placement problem, but assumes gpu-compute-only, targets 175b throughput on datacenter cards, and explicitly doesn't care about latency. the hybrids that *do* split compute across cpu and gpu — powerinfer (hot/cold neurons), fiddler and ktransformers (moe experts on cpu) — key the decision on activation sparsity or moe structure, not on a bandwidth crossover in a dense model.
+
+so the gap isn't "nobody has built a hybrid" — llama.cpp even streams to the gpu already, it just switches on a hard-coded 32. it's that **nobody has written down where the tiers actually cross**, which is the number that tells you which hybrid to build. that's a measurement, it's cheap, and step 2b takes it.
+
 concretely, three claims, each falsifiable on hardware i own: (1) the tier switch is a function of four measured numbers and the tensor's shape, not a constant — on this machine it's **14, not 32**; (2) it differs per layer, so no single threshold is right for both the mlp and the attention tensors; (3) prefetching across layers is worth 1.48x at prefill and almost nothing at decode batch 32 — so tier selection, not overlap, is where the decode win is.
 
 the mechanism that makes it work is a **tiered, quantized block allocator**. location and precision are both properties of a block, not global settings:
 
 - hot kv blocks: vram, fp16
 - aged blocks: demote precision, then evict to ram
-- weights: per-layer placement, prefetched on a copy stream
+- weights: per-layer placement across all **three** tiers (resident / cpu-compute / pcie-stream), chosen by the roofline at the current batch size, prefetched on a copy stream
 
-that composes paging, quantization and offload into one mechanism instead of three bolted together features. that part is mine.
+that composes paging, quantization and offload into one mechanism instead of three bolted together features. and because the weight tier is picked by the model rather than by hand, the policy follows b\* instead of assuming which side of it you're on. that part is mine.
 
 ## baselines
 
@@ -221,6 +260,7 @@ not that any one piece is too hard. it's spending two months on a paged attentio
 - pcie bandwidth, host-to-device, pinned vs pageable (`cudaMemcpy` microbenchmark). **this number is the second slope of the entire project.**
 - **pinned memory on wsl2.** async prefetch needs page-locked host memory (`cudaHostAlloc`). wsl2 gpu passthrough has been quirky here. if it can't hit full speed the prefetch mechanism is dead and i need native linux. find out now, not in week six.
 - does vllm build on sm_120. blackwell consumer support has been finicky and vllm is the ceiling for everything.
+- **cpu sustained gemm throughput at decode shapes.** added after step 2: this is the slope that decides b\*, and it's the one tier boundary still un-measured. cheap — a numpy/torch-cpu gemm sweep at the real (m, k) shapes, batch 1 to 32.
 
 **1. two tier roofline** - `roofline2.py`
 extend the 01 plot with the pcie slope. predict decode throughput as a function of model size, precision, and fraction of layers offloaded. **this is the artifact. everything below exists to test it.**
@@ -228,14 +268,16 @@ extend the 01 plot with the pcie slope. predict decode throughput as a function 
 **2. validate against llama.cpp** - cheap and high signal — **done, see [step 2 above](#step-2-does-the-curve-land-validated)**
 sweep `-ngl` from 0 to all layers on a model that doesn't fit. measure tokens/sec at each point. overlay the prediction from step 1. the curve lands (±6%), and it turned up the cpu-offload-vs-pcie distinction — the "if it doesn't, stop and find out why" case, which is where the second offload tier came from.
 
-**3. model runner** - `runner.py`
-load a model, kv cached greedy generate. the floor. two modes: batch 1, and static batching (pad to longest, wait for the slowest, contiguous max-length kv per sequence). the static mode matters: without it the final chart can only prove "batching helps", which nobody doubts, instead of "my batching is good", which is the actual claim.
+**3. model runner** - `runner.py` — **done**
+load a model, kv cached greedy generate. the floor. two modes: batch 1, and static batching (pad to longest, wait for the slowest, contiguous max-length kv per sequence). the static mode matters: without it the final chart can only prove "batching helps", which nobody doubts, instead of "my batching is good", which is the actual claim. both paths work; the smoke test asserts the batched slots match batch-1 exactly, since greedy is deterministic. `MODEL_ID` still needs pinning to the roofline's model.
 
-**4. quantized gemv** - `gemv.cu`, `quantize.py`
+**4. quantized gemv** - `gemv.cu`, `quantize.py`, `bench_gemv.cu` — **fp16 + w8a16 done, fp8 next**
 fp16 baseline first so there's a number to beat, then w8a16: int8 weights, fp16 activations, per-channel scales, dequant fused in-register so a weight only ever crosses the bus as one byte. then fp8 e4m3 (sm_120 has native conversion, so int8 vs fp8 is a measurement here, not a guess).
 
+the fp16 kernel is done: one warp per row, `x` staged in dynamic shared memory, warp shuffle reduction, fp32 accumulator, in two variants (scalar `half` loads and `float4` loads). against the 341 gb/s measured pure-read ceiling (384 spec), the vectorized kernel runs 289-345 gb/s, worth 5-31% over scalar and matching or beating cublas on the three smaller shapes. that cleared the gate, so w8a16 followed: int8 weights, `int4` loads (16 weights per load instruction), fp32 accumulate, and the per-row scale applied once after the warp reduction. **1.9-2.0x the fp16 kernel on every shape**, which is the point: at 1 flop/byte, halving the bytes is the whole speedup, and the fused dequant costs one multiply per row instead of one per element. the int8 kernel is checked against cublas run on the *dequantized* weights, so the check sees reduction-order rounding only (3e-4) and the accuracy price of quantizing is reported separately (rel l2 4e-3 on the bench's uniform weights, 8.3e-3 and cos_sim 0.99997 on `quantize.py`'s normal ones). the host quantizer in `bench_gemv.cu` mirrors `quantize.py` exactly, since a rounding mismatch there would look like a kernel bug.
+
 **5. offload + prefetch** - `placement.py`
-per-layer placement across vram/ram, double buffered, `cudaMemcpyAsync` on a dedicated copy stream. measure transfer/compute overlap directly. **expect it to disappoint at batch 1.** that's not a bug, it's the finding that motivates step 7. the target is priced: step 2b says overlapping the copy is worth 1.48x at prefill but only ~1.03x at decode b=32, so **placement is the win here and prefetch is the prefill win.** build the tier-selection policy first.
+per-layer placement across vram/ram, double buffered, `cudaMemcpyAsync` on a dedicated copy stream. measure transfer/compute overlap directly. **expect it to disappoint at batch 1** — that's not a bug, it's the 3.5x gap from step 2 showing up in the engine, and it's the finding that motivates step 7. the target is priced: step 2b says overlapping the copy is worth 1.48x at prefill but only ~1.03x at decode b=32, so **placement is the win here and prefetch is the prefill win.** build the tier-selection policy first, then measure b\* on the real engine against the predicted 14.
 
 **6. tiered paged kv cache** - `paged_cache.py`, `attention.cu`
 block allocator where each block carries a location and a precision. attention reads a non-contiguous, mixed-precision cache. at 8gb the cache genuinely runs out, so eviction is a real decision instead of a design doc.
@@ -244,10 +286,12 @@ block allocator where each block carries a location and a precision. attention r
 continuous batching. admit and retire requests every step. here batching stops being about serving many users and starts being about generating enough compute to hide pcie behind.
 
 **8. bench + plot** - `bench.py`, `plot_engine.py`
-sweep batch size x precision x offload fraction across all systems. record where each one ooms. overlay every measurement on the step 1 prediction.
+sweep batch size x precision x offload fraction across all systems. record where each one ooms. overlay every measurement on the step 1 prediction. **b\* is the money point on this chart** — the batch size where the pcie-stream line crosses llama.cpp's cpu-offload line.
 
-**9. stretch: speculative decoding**
+**9. speculative decoding** — promoted from stretch
 the escape that works at batch 1. use the int4 model as its own draft, verify with fp16. prior work exists (ml-specqd, quantspec), build on it, don't re-derive it.
+
+**why it's no longer a stretch:** the hybrid only wins above b\*, and a single local user has no natural batch. speculative decoding manufactures one — verifying k draft tokens in a single forward pass *is* a batch of k, which is arithmetic intensity bought without a second user. without this, the engine's win region is real but nobody local ever enters it.
 
 ## layout
 
@@ -256,8 +300,11 @@ kernels in cuda, harness in python. same split as 02: `.cu` files build into one
 grouped by deliverable. run scripts from THIS directory as modules so the
 cross-package imports resolve, e.g. `python3 -m roofline.validate_llamacpp`.
 
+files marked *todo* don't exist yet.
+
 ```
 setup.py               builds the cuda extension (top level: sees all kernels)
+Makefile               standalone nvcc build + `make ext` for the torch extension
 
 roofline/              deliverable #1: the model + its validation
   roofline2.py         the tier model: bandwidth AND compute ceiling per tier
@@ -266,18 +313,19 @@ roofline/              deliverable #1: the model + its validation
 
 engine/                deliverable #2: the engine (the part that's mine)
   runner.py            the floor: batch 1 + static batching
-  quantize.py          per-channel scales + weight packing
-  placement.py         vram/ram layer placement + prefetch streams
-  paged_cache.py       block allocator, location + precision per block
-  scheduler.py         continuous batching
-  engine.py            mine: ties placement, cache, scheduler and kernels together
+  quantize.py          per-channel symmetric int8 scales + the layout contract
+  placement.py         todo: three-tier layer placement + prefetch streams
+  paged_cache.py       todo: block allocator, location + precision per block
+  scheduler.py         todo: continuous batching
+  engine.py            todo, mine: ties placement, cache, scheduler and kernels together
   kernels/
-    gemv.cu            fp16 / int8 / fp8 fused dequant matvec
-    attention.cu       attention over the tiered paged cache
+    gemv.cu            fp16 / int8 / fp8 fused dequant matvec (fp8 still todo)
+    bench_gemv.cu      standalone bandwidth harness, cublas-checked, csv out
+    attention.cu       todo: attention over the tiered paged cache
 
 bench/                 ties it together
-  bench.py             sweep over all systems
-  plot_engine.py       the charts
+  bench.py             todo: sweep over all systems
+  plot_engine.py       todo: the charts
 ```
 
 ## notes

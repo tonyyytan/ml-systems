@@ -20,10 +20,10 @@
 // Max-P (115 W) estimates; max-Q mode will be lower.
 //   FP32 : 3840 CUDA cores × 2 ops/cycle × 2.497 GHz ≈ 19.2 TFLOPS
 //   FP16 : Blackwell 5th-gen tensor cores, 8× FP32 dense  ≈ 153.6 TFLOPS
-//   BW   : 128-bit GDDR7 @ ~17 Gbps                       ≈ 272 GB/s
+//   BW   : 128-bit GDDR7 @ 24 Gbps                        ≈ 384 GB/s
 static constexpr double PEAK_FP32_TFLOPS = 19.2;
 static constexpr double PEAK_FP16_TFLOPS = 153.6;
-static constexpr double MEM_BW_TB_S      = 0.272;
+static constexpr double MEM_BW_TB_S      = 0.384;
 
 #define CUDA_CHECK(call)                                                          \
     do {                                                                          \

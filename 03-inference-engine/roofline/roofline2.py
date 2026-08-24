@@ -3,8 +3,9 @@ Project 03, Step 1: the two-tier roofline. THE deliverable.
 
 01 asked "compute or bandwidth bound?" for a resident workload. This asks the
 same question once the model no longer fits: some layers live in VRAM (streamed
-at ~272 GB/s) and the rest spill to system RAM (streamed across PCIe at ~14
-GB/s). Decode has to read every weight to make one token, so per-token time is
+at ~272 GB/s achieved, 71% of the card's 384 peak) and the rest spill to system
+RAM (streamed across PCIe at ~14 GB/s, measured, not spec). Decode has to read
+every weight to make one token, so per-token time is
 the sum of two bandwidth terms, not one:
 
     t_token  ~=  bytes_in_vram / VRAM_BW  +  bytes_in_ram / PCIE_BW
@@ -26,7 +27,15 @@ OUT_DIR = Path(__file__).parent
 # --- hardware constants -----------------------------------------------------
 # Measured on the Legion 5 / RTX 5060 (Blackwell GB206), WSL2. PCIE_BW is the
 # offload slope from the Step 0 pinned-H2D microbenchmark, not a spec sheet.
-VRAM_BW_GB_S = 272    # resident slope, GB206 peak (reused from 01/02)
+# The resident slope is an ACHIEVED rate, not the spec peak -- nothing streams at
+# peak. Kept as peak x efficiency so the assumption is visible and swappable:
+# STREAM_EFF is llama.cpp's, which is what step 2 validates against. Step 4's own
+# gemv already sustains 310-345 GB/s (0.81-0.90), so the engine's resident tier
+# should beat this once the kernels are wired in -- that headroom is the point.
+PEAK_BW_GB_S = 384    # GB206 spec: 128-bit GDDR7 @ 24 Gbps. ceiling, never reached.
+STREAM_EFF = 0.707    # MEASURED: llama.cpp Q4_K_M, ngl=32, seq 2048 -> 52.35 tok/s
+                      # x 5.19 GB/token = 271.5 GB/s. see validate_llamacpp.py.
+VRAM_BW_GB_S = round(PEAK_BW_GB_S * STREAM_EFF, 1)   # 271.5, the slope step 2 validates
 PCIE_BW_GB_S = 14     # offload slope, MEASURED pinned H2D on WSL2 (pageable ~13,
                       # so the pinned gap is thin here). below the ~16-32 hoped for.
 CPU_BW_GB_S = 48      # second offload tier. llama.cpp -ngl computes offloaded layers
