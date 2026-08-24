@@ -1,6 +1,6 @@
 # 03 inference engine
 
-in progress. this is the capstone. the tier roofline (steps 1-2b) is done and validated against llama.cpp — including the batch axis, where it predicts the tier crossover at **b\* = 14** against llama.cpp's hard-coded 32. the runner floor (step 3) generates tokens. step 4, the quantized gemv, is half done: the fp16 baseline is written, wired to python, and benchmarked against cublas (321 gb/s, 96% of the measured ceiling on o_proj), and the int8 quantization contract is fixed. the fused-dequant kernel is next.
+in progress. this is the capstone. the tier roofline (steps 1-2b) is done and validated against llama.cpp — including the batch axis, where it predicts the tier crossover at **b\* = 14** against llama.cpp's hard-coded 32. the runner floor (step 3) generates tokens. step 4, the quantized gemv, is done through w8a16: int8 weights with dequant fused in-register run 1.9-2.0x the fp16 baseline, which itself sits at 90-101% of the measured bandwidth ceiling. fp8 e4m3 is next.
 
 ## what it is
 
@@ -271,10 +271,10 @@ sweep `-ngl` from 0 to all layers on a model that doesn't fit. measure tokens/se
 **3. model runner** - `runner.py` — **done**
 load a model, kv cached greedy generate. the floor. two modes: batch 1, and static batching (pad to longest, wait for the slowest, contiguous max-length kv per sequence). the static mode matters: without it the final chart can only prove "batching helps", which nobody doubts, instead of "my batching is good", which is the actual claim. both paths work; the smoke test asserts the batched slots match batch-1 exactly, since greedy is deterministic. `MODEL_ID` still needs pinning to the roofline's model.
 
-**4. quantized gemv** - `gemv.cu`, `quantize.py`, `bench_gemv.cu` — **fp16 baseline done, w8a16 next**
+**4. quantized gemv** - `gemv.cu`, `quantize.py`, `bench_gemv.cu` — **fp16 + w8a16 done, fp8 next**
 fp16 baseline first so there's a number to beat, then w8a16: int8 weights, fp16 activations, per-channel scales, dequant fused in-register so a weight only ever crosses the bus as one byte. then fp8 e4m3 (sm_120 has native conversion, so int8 vs fp8 is a measurement here, not a guess).
 
-the fp16 kernel is done: one warp per row, `x` staged in dynamic shared memory, warp shuffle reduction, fp32 accumulator, in two variants (scalar `half` loads and `float4` loads). `bench_gemv.cu` sweeps the five decode shapes against cublas `GemmEx` and `HSHgemvStridedBatched` with l2 flushed between iterations; see `gemv_results.csv`. vectorizing the loads is worth 5-31%, largest on the small `kv_proj` shape where the scalar kernel cannot keep enough loads in flight. against the 334 gb/s measured pure-read ceiling (384 spec), the vectorized kernel runs 271-321 gb/s, matching or beating cublas on the three smaller shapes and landing ~3% behind on the two large ones. that clears the measurement gate, so w8a16 can start: no quantized kernel until the fp16 baseline is near the ceiling, because a quantization speedup against a bad baseline means nothing. `quantize.py` fixes the layout contract the kernel will be written against (per-channel symmetric int8, absmax rtn, cos_sim 0.99996 on random normal weights); the host-side quantizer in `bench_gemv.cu` still has to mirror it exactly.
+the fp16 kernel is done: one warp per row, `x` staged in dynamic shared memory, warp shuffle reduction, fp32 accumulator, in two variants (scalar `half` loads and `float4` loads). against the 341 gb/s measured pure-read ceiling (384 spec), the vectorized kernel runs 289-345 gb/s, worth 5-31% over scalar and matching or beating cublas on the three smaller shapes. that cleared the gate, so w8a16 followed: int8 weights, `int4` loads (16 weights per load instruction), fp32 accumulate, and the per-row scale applied once after the warp reduction. **1.9-2.0x the fp16 kernel on every shape**, which is the point: at 1 flop/byte, halving the bytes is the whole speedup, and the fused dequant costs one multiply per row instead of one per element. the int8 kernel is checked against cublas run on the *dequantized* weights, so the check sees reduction-order rounding only (3e-4) and the accuracy price of quantizing is reported separately (rel l2 4e-3 on the bench's uniform weights, 8.3e-3 and cos_sim 0.99997 on `quantize.py`'s normal ones). the host quantizer in `bench_gemv.cu` mirrors `quantize.py` exactly, since a rounding mismatch there would look like a kernel bug.
 
 **5. offload + prefetch** - `placement.py`
 per-layer placement across vram/ram, double buffered, `cudaMemcpyAsync` on a dedicated copy stream. measure transfer/compute overlap directly. **expect it to disappoint at batch 1** — that's not a bug, it's the 3.5x gap from step 2 showing up in the engine, and it's the finding that motivates step 7. the target is priced: step 2b says overlapping the copy is worth 1.48x at prefill but only ~1.03x at decode b=32, so **placement is the win here and prefetch is the prefill win.** build the tier-selection policy first, then measure b\* on the real engine against the predicted 14.
@@ -319,7 +319,7 @@ engine/                deliverable #2: the engine (the part that's mine)
   scheduler.py         todo: continuous batching
   engine.py            todo, mine: ties placement, cache, scheduler and kernels together
   kernels/
-    gemv.cu            fp16 / int8 / fp8 fused dequant matvec (fp16 done, int8 next)
+    gemv.cu            fp16 / int8 / fp8 fused dequant matvec (fp8 still todo)
     bench_gemv.cu      standalone bandwidth harness, cublas-checked, csv out
     attention.cu       todo: attention over the tiered paged cache
 
