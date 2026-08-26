@@ -18,7 +18,8 @@ One curve flattens, one keeps climbing, so they cross. b* is that crossing, and
 it is the number that says whether this engine has a window to win in.
 
 For context on what to beat: llama.cpp does have a streaming path, but it fires
-on a hard-coded constant (ggml-cuda.cu, op_offload_min_batch_size = 32) rather
+on a constant a human picks (ggml-cuda.cu, op_offload_min_batch_size, 32 by
+default, GGML_OP_OFFLOAD_MIN_BATCH overrides) rather
 than on anything measured about the machine.
 
     python3 -m roofline.batch_crossover
@@ -37,7 +38,7 @@ OUT_DIR = Path(__file__).parent
 BITS = 4.9        # Q4_K_M on disk, the same effective bits step 2 validated at
 SEQ_LEN = 2048
 OFFLOAD_FRAC = 1.0
-LLAMACPP_MIN_BATCH = 32   # ggml-cuda.cu:5357, the constant this is all measured against
+LLAMACPP_MIN_BATCH = 32   # ggml-cuda.cu:5507 default, the constant this is all measured against
 
 BATCHES = [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 256, 512]
 
@@ -120,7 +121,7 @@ def plot_crossover(b_star: float | None) -> None:
                     textcoords="offset points", xytext=(6, 0), fontsize=10)
     ax.axvspan(b_star or 1, LLAMACPP_MIN_BATCH, color="#DD8452", alpha=0.08)
     ax.axvline(LLAMACPP_MIN_BATCH, color="#937860", linestyle="-.", linewidth=1.3,
-               label=f"llama.cpp op-offload threshold ({LLAMACPP_MIN_BATCH}, hard-coded)")
+               label=f"llama.cpp op-offload threshold ({LLAMACPP_MIN_BATCH}, its default)")
 
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
