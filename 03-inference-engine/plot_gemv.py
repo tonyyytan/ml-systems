@@ -26,8 +26,8 @@ PEAK_BW_GB_S = 384.0
 WARMUP_ITERS = 20
 TIMED_ITERS = 100
 FLUSH_BYTES = 128 << 20
+SPEEDUP_YMAX = 2.75
 
-# categorical slots 1-3, validated all-pairs in both modes
 C_SCALAR = "#2a78d6"
 C_VEC = "#eb6834"
 C_INT8 = "#1baf7a"
@@ -147,12 +147,13 @@ def speedup_panel(ax, order, torch_ms):
                     ha="center", va="bottom", fontsize=7, color=C_TEXT_2)
 
     ax.axhline(1.0, color=C_TEXT_2, linewidth=1, linestyle="--")
-    ax.text(len(order) - 0.5, 2.62, "dashed line = pytorch  W @ x", ha="right", fontsize=7.5, color=C_TEXT_2)
+    ax.text(len(order) - 0.5, SPEEDUP_YMAX - 0.13, "dashed line = pytorch  W @ x",
+            ha="right", fontsize=7.5, color=C_TEXT_2)
 
     ax.set_xticks(list(xs))
     ax.set_xticklabels(order)
     ax.set_ylabel("speedup over pytorch (wall clock)")
-    ax.set_ylim(0, 2.75)
+    ax.set_ylim(0, SPEEDUP_YMAX)
     ax.set_title("what that buys at batch 1", fontsize=10.5, color=C_TEXT, loc="left", pad=10)
 
 

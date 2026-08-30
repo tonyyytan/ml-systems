@@ -1,6 +1,6 @@
 # 03 inference engine
 
-in progress. this is the capstone. the tier roofline (steps 1-2b) is done and validated against llama.cpp — including the batch axis, where it predicts the tier crossover at **b\* = 14** against llama.cpp's default of 32. that prediction has since been **measured at 15.5** with a drift-controlled a/b sweep, worth **1.5x prefill throughput**, and shown to move to **28.7 under q8_0** — filed upstream as [llama.cpp #27425](https://github.com/ggml-org/llama.cpp/issues/27425). the runner floor (step 3) generates tokens. step 4, the quantized gemv, is done through w8a16: int8 weights with dequant fused in-register run 1.9-2.0x the fp16 baseline, which itself sits at 85-101% of the measured bandwidth ceiling. fp8 e4m3 is next.
+in progress. this is the capstone. the tier roofline (steps 1-2b) is done and validated against llama.cpp — including the batch axis, where it predicts the tier crossover at **b\* = 14** against llama.cpp's default of 32. that prediction has since been **measured at 15.5** with a drift-controlled a/b sweep, worth **1.5x prefill throughput**, and shown to move to **28.7 under q8_0** — filed upstream as [llama.cpp #27425](https://github.com/ggml-org/llama.cpp/issues/27425). **the tuner that turns that into flags now exists** in `tune/`: the seven constants the model runs on are measured rather than hand-entered, and `autotune.py` emits `-ngl` and `GGML_OP_OFFLOAD_MIN_BATCH` for a given gguf. the runner floor (step 3) generates tokens. step 4, the quantized gemv, is done through w8a16: int8 weights with dequant fused in-register run 1.9-2.0x the fp16 baseline, which itself sits at 85-101% of the measured bandwidth ceiling. fp8 e4m3 is next.
 
 ## what it is
 
@@ -172,10 +172,11 @@ which also prices the thing step 5 is for — and the price is batch dependent i
 so **prefetch is a prefill/large-batch optimisation, not the decode win.** in the 14-32 band the entire gain comes from picking the right tier, not from overlapping the copy. worth knowing before spending a month on a copy-stream pipeline for step 5.
 
 ```
-python3 -m roofline.batch_crossover
+python3 -m roofline.batch_crossover     # the prediction
+python3 -m tune.analyze_crossover       # the measurement, from tune/data/
 ```
 
-**b\* has since been measured directly.** an alternating always/never op-offload sweep (configs interleaved across repetitions so thermal drift cannot favour either) puts the q4_k_m crossover at **15.5** against the predicted 14, flat in `-ngl` (8/16/24 -> 15.3/15.5/15.6), and moves it to **28.7** on q8_0 -- roughly the bytes-per-weight ratio, which is the argument that no fixed default can be right. lowering the threshold is worth **1.50x** at pp24 (116.6 vs 77.6 tok/s, drift-controlled means). filed upstream as [#27425](https://github.com/ggml-org/llama.cpp/issues/27425). note the model runs ~10-15% low in both quants, so quote it as "predicted 14, measured 15.5", not as an exact hit. what is still modeled and not measured: batched *decode* specifically, which needs `llama-batched-bench -npl 1..64`; the sweep above is prefill.
+**b\* has since been measured directly.** an alternating always/never op-offload sweep (configs interleaved across repetitions so thermal drift cannot favour either) puts the q4_k_m crossover at **15.5** against the predicted 14, flat in `-ngl` (8/16/24 -> 15.3/15.5/15.6), and moves it to **28.7** on q8_0 -- 1.85x, against 1.74x more bytes per weight (8.5 bits/param vs 4.9, as llama-bench reports the two files). so it moves with the quant without being fully explained by it, which is the argument that no fixed default and no per-device cache can be right. lowering the threshold is worth **1.50x** at pp24 (116.6 vs 77.6 tok/s, drift-controlled means). filed upstream as [#27425](https://github.com/ggml-org/llama.cpp/issues/27425). note the model runs ~10-15% low in both quants, so quote it as "predicted 14, measured 15.5", not as an exact hit. what is still modeled and not measured: batched *decode* specifically, which needs `llama-batched-bench -npl 1..64`; the sweep above is prefill.
 
 ### so the policy is an argmin, not a blend
 
@@ -208,7 +209,7 @@ what doesn't exist is the model. everyone who runs local models hits this cliff 
 
 so the gap isn't "nobody has built a hybrid" — llama.cpp even streams to the gpu already, it just switches on a constant a human picks (32 by default). it's that **nobody has written down where the tiers actually cross**, which is the number that tells you which hybrid to build. that's a measurement, it's cheap, step 2b takes it, and it turned out to be **15.5 rather than 32** on this machine.
 
-concretely, three claims, each falsifiable on hardware i own: (1) the tier switch is a function of four measured numbers and the tensor's shape, not a constant — predicted at **14** against a default of 32, **measured at 15.5**, and **28.7 under q8_0**, which tracks bytes per weight (9.1 vs 4.9 bits/param is 1.86x; 28.7/15.5 is 1.85x) and is the argument that no fixed default and no per-machine cache can be right; (2) it differs per layer, so no single threshold is right for both the mlp and the attention tensors; (3) prefetching across layers is worth 1.48x at prefill and almost nothing at decode batch 32 — so tier selection, not overlap, is where the decode win is.
+concretely, three claims, each falsifiable on hardware i own: (1) the tier switch is a function of four measured numbers and the tensor's shape, not a constant — predicted at **14** against a default of 32, **measured at 15.5**, and **28.7 under q8_0**, which moves with bytes per weight (8.5 vs 4.9 bits/param is 1.74x, against 1.85x in the crossover) and is the argument that no fixed default and no per-machine cache can be right; (2) it differs per layer, so no single threshold is right for both the mlp and the attention tensors; (3) prefetching across layers is worth 1.48x at prefill and almost nothing at decode batch 32 — so tier selection, not overlap, is where the decode win is.
 
 **and the delivery mechanism is flags, not an engine.** llama.cpp already has every *mechanism* this needs: `-ngl` for layer count, `-ot` for per-tensor placement by regex, `-ncmoe` for experts, `GGML_OP_OFFLOAD_MIN_BATCH` for the tier switch. what it does not have is a *policy* — nothing tells you what to set them to, so every value is hand-picked and 32 is 32 because someone chose 32. so the deliverable is an **autotuner**: measure four constants, run the roofline, emit the flags. that is validated on the reference implementation everyone already runs, which is stronger evidence than an engine i wrote and tuned myself, and it is a fraction of the code. the engine below is for what flags cannot express: mixed-precision kv per block, continuous batching, speculative decoding.
 
@@ -219,6 +220,60 @@ the mechanism that makes it work is a **tiered, quantized block allocator**. loc
 - weights: per-layer placement across all **three** tiers (resident / cpu-compute / pcie-stream), chosen by the roofline at the current batch size, prefetched on a copy stream
 
 that composes paging, quantization and offload into one mechanism instead of three bolted together features. and because the weight tier is picked by the model rather than by hand, the policy follows b\* instead of assuming which side of it you're on. that part is mine.
+
+## the autotuner
+
+`tune/` is the deliverable the rest of this points at. the argument above is that the tier switch is a
+function of measured numbers rather than a constant, and the honest form of that argument is not an essay,
+it's a program that measures the numbers and prints the constant.
+
+three pieces, each runnable on its own:
+
+```
+python3 -m tune.measure_machine -m model.gguf     # the seven constants -> tune/machine.json
+python3 -m tune.autotune -m model.gguf            # the constants -> llama.cpp flags
+python3 -m tune.autotune -m model.gguf --verify   # the flags vs the defaults, on the real binary
+./tune/crossover.sh -m model.gguf -o out.csv      # the ground truth b*, measured directly
+python3 -m tune.analyze_crossover                 # that sweep -> b*
+```
+
+**every constant in `roofline2.py` is now measured by a script rather than typed in.** re-measured today,
+six of the seven land within a few percent of the hand-entered values (pcie 14.3 vs 14, cpu 48.3 vs 48
+gb/s, cpu 0.563 vs 0.60 tflop/s, stream efficiency 0.687 vs 0.707). the seventh does not: gpu prefill comes
+in at 32.6 tflop/s against the 41.6 in the file. it happens not to matter — pcie-stream is copy bound at
+every practical batch, so b\* is completely insensitive to it, and only the cpu ceiling moves the answer
+(0.60 -> 0.563 tflop/s takes b\* from 14 to 13). but "it happens not to matter" is something you can only
+say after measuring, which is the case for the script.
+
+what it emits, on this laptop, for llama-3.1-8b:
+
+| model | fits? | flags |
+|---|---|---|
+| q4_k_m, ctx 2048 | yes, 32/32 layers | `-ngl 32` (the threshold never fires) |
+| q8_0, ctx 2048 | no, 26/32 layers | `GGML_OP_OFFLOAD_MIN_BATCH=22 -ngl 26` |
+
+and `--verify` runs that answer against llama.cpp's defaults, configs alternated across repetitions, on
+q8_0:
+
+| prompt | tuned | default | gain |
+|---:|---:|---:|---:|
+| 22 | 126.3 | 135.8 | 0.93x |
+| 27 | 158.6 | 146.4 | **1.08x** |
+| 31 | 180.0 | 157.1 | **1.15x** |
+| 64 | 379.1 | 374.3 | 1.01x (control — both offload here) |
+
+read that honestly. the tuned flags win where they should and the control behaves, so the mechanism is
+real. but the loss at pp22 is the model's known bias showing up end to end: it puts b\* at 22 when the
+measured crossing here is around 24, so the emitted threshold switches tiers slightly too early and pays
+7% for it at exactly the batch it nominated. **the tool beats the default across the band and is worse
+than the default at its own recommendation.** closing that is the next thing worth doing, and the fix is
+a calibration term, not a better guess.
+
+### what it does not emit
+
+no `-ot` regex. claim (2) above — that the mlp and attention tensors want different thresholds — is
+predicted from their transfer/compute ratios and **has never been measured**. emitting a per-tensor
+placement on the strength of a prediction would be the exact failure this tool exists to correct.
 
 ## baselines
 
@@ -259,8 +314,8 @@ not that any one piece is too hard. it's spending two months on a paged attentio
 ## build order
 
 **0. measure the machine.** half a day, before any engine code.
-- pcie bandwidth, host-to-device, pinned vs pageable (`cudaMemcpy` microbenchmark). **this number is the second slope of the entire project.**
-- **pinned memory on wsl2.** async prefetch needs page-locked host memory (`cudaHostAlloc`). wsl2 gpu passthrough has been quirky here. if it can't hit full speed the prefetch mechanism is dead and i need native linux. find out now, not in week six.
+- pcie bandwidth, host-to-device, pinned vs pageable (`cudaMemcpy` microbenchmark). **this number is the second slope of the entire project.** **done**, and it is a script now (`tune/h2d.cu`, driven by `tune/measure_machine.py`) rather than a number i once typed into a comment: **14.3 gb/s pinned, 13.6 pageable**, over a sweep from 1 mib to 512 mib. the link negotiates gen4 **x8** against a x16 maximum, which is reported alongside the bandwidth — a pcie number without the link state beside it can't be compared to anyone else's.
+- **pinned memory on wsl2.** async prefetch needs page-locked host memory (`cudaHostAlloc`). wsl2 gpu passthrough has been quirky here. if it can't hit full speed the prefetch mechanism is dead and i need native linux. **done, and the answer is "it works, and it barely helps":** pinned beats pageable by 5% here (14.3 vs 13.6), against the 2x the usual advice implies. the prefetch mechanism is alive, but pinning is not where its win comes from.
 - does vllm build on sm_120. blackwell consumer support has been finicky and vllm is the ceiling for everything.
 - **cpu sustained gemm throughput at decode shapes.** added after step 2, **done in step 2b**: this is the slope that decides b\*. measured at 0.60 tflops from llama.cpp's own prefill (`-ngl 0 -nopo 1 -p 512` -> 37.4 tok/s), which is a better number than a synthetic gemm sweep would have given, since it is the same code path that sets the tier's throughput. lives in `roofline2.py` as `CPU_TFLOPS`.
 
@@ -317,7 +372,16 @@ roofline/              deliverable #1: the model + its validation
   validate_llamacpp.py step 2 gate: overlay -ngl measurements on the prediction
   batch_crossover.py   step 2b: sweep batch, find b*, price the prefetch headroom
 
-engine/                deliverable #2: the engine (the part that's mine)
+tune/                  deliverable #2: the autotuner. the model, made usable.
+  h2d.cu               step 0: pinned/pageable pcie sweep + what the device says about itself
+  measure_machine.py   drives it, adds the llama.cpp probes, writes machine.json
+  machine.json         this laptop's seven constants, as measured
+  autotune.py          machine.json + a gguf -> -ngl and GGML_OP_OFFLOAD_MIN_BATCH
+  crossover.sh         the drift-controlled always/never sweep: b*, measured not predicted
+  analyze_crossover.py that sweep -> b*, and what the default costs
+  data/                the sweeps behind the 15.3/15.5/15.6 and 28.7 numbers
+
+engine/                deliverable #3: the engine, for what flags cannot express
   runner.py            the floor: batch 1 + static batching
   quantize.py          per-channel symmetric int8 scales + the layout contract
   placement.py         todo: three-tier layer placement + prefetch streams
